@@ -1,0 +1,784 @@
+{
+  "matches": [
+    {
+      "match_id": 2,
+      "label": "Zulte Waregem vs KVC Westerlo U18",
+      "date": "2025-11-22",
+      "opponent": "KVC Westerlo U18",
+      "score": "3 : 1",
+      "correlations": {
+        "Possession Football vs Direct Football": 0.813,
+        "Possession Football vs High Pressing": 0.896,
+        "Possession Football vs Chance Creation Focus": 0.852,
+        "Direct Football vs High Pressing": 0.918,
+        "Direct Football vs Chance Creation Focus": 0.764,
+        "High Pressing vs Chance Creation Focus": 0.852
+      },
+      "top5_overlap": {
+        "Possession Football vs Direct Football": 0.8,
+        "Possession Football vs High Pressing": 1.0,
+        "Possession Football vs Chance Creation Focus": 0.8,
+        "Direct Football vs High Pressing": 0.8,
+        "Direct Football vs Chance Creation Focus": 0.6,
+        "High Pressing vs Chance Creation Focus": 0.8
+      },
+      "rankings": {
+        "Possession Football": [
+          [
+            "Liam Hendrycks",
+            138.49
+          ],
+          [
+            "Kiyan Kanatlar",
+            136.36
+          ],
+          [
+            "Loris D'Haene",
+            133.93
+          ],
+          [
+            "Seppe Vandenberghe",
+            133.84
+          ],
+          [
+            "Emiel De Groote",
+            126.62
+          ],
+          [
+            "Dries Vandevelde",
+            122.55
+          ],
+          [
+            "Benyamin Akhandaf",
+            108.84
+          ],
+          [
+            "Ray Morton",
+            102.39
+          ],
+          [
+            "Daan Maertens",
+            98.14
+          ],
+          [
+            "Maxime Libbenga",
+            85.46
+          ],
+          [
+            "Ian Timmerman",
+            81.72
+          ],
+          [
+            "Arno Vleeschouwer",
+            81.15
+          ],
+          [
+            "Arnaud Perneel",
+            65.76
+          ]
+        ],
+        "Direct Football": [
+          [
+            "Seppe Vandenberghe",
+            354.14
+          ],
+          [
+            "Loris D'Haene",
+            349.34
+          ],
+          [
+            "Emiel De Groote",
+            307.3
+          ],
+          [
+            "Liam Hendrycks",
+            287.52
+          ],
+          [
+            "Dries Vandevelde",
+            236.14
+          ],
+          [
+            "Kiyan Kanatlar",
+            227.42
+          ],
+          [
+            "Ray Morton",
+            222.7
+          ],
+          [
+            "Arno Vleeschouwer",
+            215.19
+          ],
+          [
+            "Daan Maertens",
+            213.39
+          ],
+          [
+            "Benyamin Akhandaf",
+            208.5
+          ],
+          [
+            "Maxime Libbenga",
+            189.34
+          ],
+          [
+            "Ian Timmerman",
+            92.24
+          ],
+          [
+            "Arnaud Perneel",
+            28.16
+          ]
+        ],
+        "High Pressing": [
+          [
+            "Loris D'Haene",
+            259.75
+          ],
+          [
+            "Seppe Vandenberghe",
+            213.6
+          ],
+          [
+            "Liam Hendrycks",
+            206.24
+          ],
+          [
+            "Emiel De Groote",
+            192.05
+          ],
+          [
+            "Kiyan Kanatlar",
+            174.49
+          ],
+          [
+            "Daan Maertens",
+            171.84
+          ],
+          [
+            "Dries Vandevelde",
+            171.36
+          ],
+          [
+            "Ray Morton",
+            163.47
+          ],
+          [
+            "Benyamin Akhandaf",
+            153.1
+          ],
+          [
+            "Maxime Libbenga",
+            148.99
+          ],
+          [
+            "Arno Vleeschouwer",
+            80.02
+          ],
+          [
+            "Ian Timmerman",
+            49.47
+          ],
+          [
+            "Arnaud Perneel",
+            38.5
+          ]
+        ],
+        "Chance Creation Focus": [
+          [
+            "Seppe Vandenberghe",
+            259.87
+          ],
+          [
+            "Kiyan Kanatlar",
+            202.44
+          ],
+          [
+            "Emiel De Groote",
+            200.79
+          ],
+          [
+            "Loris D'Haene",
+            184.12
+          ],
+          [
+            "Benyamin Akhandaf",
+            159.21
+          ],
+          [
+            "Liam Hendrycks",
+            153.95
+          ],
+          [
+            "Daan Maertens",
+            115.37
+          ],
+          [
+            "Dries Vandevelde",
+            77.67
+          ],
+          [
+            "Ray Morton",
+            67.24
+          ],
+          [
+            "Ian Timmerman",
+            63.79
+          ],
+          [
+            "Maxime Libbenga",
+            55.75
+          ],
+          [
+            "Arno Vleeschouwer",
+            46.73
+          ],
+          [
+            "Arnaud Perneel",
+            10.06
+          ]
+        ]
+      }
+    },
+    {
+      "match_id": 3,
+      "label": "Zulte Waregem vs Club Brugge KV U18",
+      "date": "2025-10-25",
+      "opponent": "Club Brugge KV U18",
+      "score": "0 : 1",
+      "correlations": {
+        "Possession Football vs Direct Football": 0.818,
+        "Possession Football vs High Pressing": 0.639,
+        "Possession Football vs Chance Creation Focus": 0.857,
+        "Direct Football vs High Pressing": 0.668,
+        "Direct Football vs Chance Creation Focus": 0.729,
+        "High Pressing vs Chance Creation Focus": 0.646
+      },
+      "top5_overlap": {
+        "Possession Football vs Direct Football": 0.4,
+        "Possession Football vs High Pressing": 0.4,
+        "Possession Football vs Chance Creation Focus": 0.6,
+        "Direct Football vs High Pressing": 0.6,
+        "Direct Football vs Chance Creation Focus": 0.8,
+        "High Pressing vs Chance Creation Focus": 0.6
+      },
+      "rankings": {
+        "Possession Football": [
+          [
+            "Pieter Moens",
+            113.14
+          ],
+          [
+            "Ray Morton",
+            109.84
+          ],
+          [
+            "Dries Vandevelde",
+            109.56
+          ],
+          [
+            "Arnaud Perneel",
+            105.66
+          ],
+          [
+            "Oleksandr Boiko",
+            103.63
+          ],
+          [
+            "Maxime Libbenga",
+            99.41
+          ],
+          [
+            "Seppe Vandenberghe",
+            97.82
+          ],
+          [
+            "Arno Vleeschouwer",
+            97.3
+          ],
+          [
+            "Loris D'Haene",
+            96.36
+          ],
+          [
+            "Ennio Donse",
+            92.47
+          ],
+          [
+            "Emiel De Groote",
+            89.3
+          ],
+          [
+            "Lowie De Groote",
+            82.42
+          ],
+          [
+            "Ian Timmerman",
+            67.8
+          ],
+          [
+            "Lex Peirsegaele",
+            54.24
+          ],
+          [
+            "Benyamin Akhandaf",
+            43.12
+          ]
+        ],
+        "Direct Football": [
+          [
+            "Ray Morton",
+            264.16
+          ],
+          [
+            "Seppe Vandenberghe",
+            209.07
+          ],
+          [
+            "Arno Vleeschouwer",
+            200.59
+          ],
+          [
+            "Pieter Moens",
+            186.53
+          ],
+          [
+            "Maxime Libbenga",
+            182.34
+          ],
+          [
+            "Dries Vandevelde",
+            176.61
+          ],
+          [
+            "Arnaud Perneel",
+            165.86
+          ],
+          [
+            "Oleksandr Boiko",
+            130.74
+          ],
+          [
+            "Loris D'Haene",
+            119.58
+          ],
+          [
+            "Ennio Donse",
+            107.82
+          ],
+          [
+            "Lex Peirsegaele",
+            87.32
+          ],
+          [
+            "Lowie De Groote",
+            82.31
+          ],
+          [
+            "Emiel De Groote",
+            82.23
+          ],
+          [
+            "Ian Timmerman",
+            47.03
+          ],
+          [
+            "Benyamin Akhandaf",
+            29.24
+          ]
+        ],
+        "High Pressing": [
+          [
+            "Ray Morton",
+            139.63
+          ],
+          [
+            "Ennio Donse",
+            112.8
+          ],
+          [
+            "Seppe Vandenberghe",
+            110.58
+          ],
+          [
+            "Pieter Moens",
+            104.04
+          ],
+          [
+            "Emiel De Groote",
+            101.5
+          ],
+          [
+            "Maxime Libbenga",
+            100.72
+          ],
+          [
+            "Oleksandr Boiko",
+            96.14
+          ],
+          [
+            "Dries Vandevelde",
+            91.84
+          ],
+          [
+            "Arno Vleeschouwer",
+            88.21
+          ],
+          [
+            "Arnaud Perneel",
+            76.77
+          ],
+          [
+            "Loris D'Haene",
+            72.9
+          ],
+          [
+            "Lex Peirsegaele",
+            55.03
+          ],
+          [
+            "Lowie De Groote",
+            48.83
+          ],
+          [
+            "Ian Timmerman",
+            36.65
+          ],
+          [
+            "Benyamin Akhandaf",
+            32.62
+          ]
+        ],
+        "Chance Creation Focus": [
+          [
+            "Pieter Moens",
+            131.28
+          ],
+          [
+            "Seppe Vandenberghe",
+            130.59
+          ],
+          [
+            "Ray Morton",
+            121.86
+          ],
+          [
+            "Arnaud Perneel",
+            85.58
+          ],
+          [
+            "Maxime Libbenga",
+            77.18
+          ],
+          [
+            "Dries Vandevelde",
+            66.86
+          ],
+          [
+            "Oleksandr Boiko",
+            60.13
+          ],
+          [
+            "Emiel De Groote",
+            49.68
+          ],
+          [
+            "Ian Timmerman",
+            46.84
+          ],
+          [
+            "Loris D'Haene",
+            44.88
+          ],
+          [
+            "Arno Vleeschouwer",
+            41.29
+          ],
+          [
+            "Ennio Donse",
+            39.41
+          ],
+          [
+            "Lowie De Groote",
+            27.61
+          ],
+          [
+            "Lex Peirsegaele",
+            26.9
+          ],
+          [
+            "Benyamin Akhandaf",
+            10.27
+          ]
+        ]
+      }
+    },
+    {
+      "match_id": 1,
+      "label": "Zulte Waregem vs R Charleroi SC U18",
+      "date": "2025-09-20",
+      "opponent": "R Charleroi SC U18",
+      "score": "4 : 1",
+      "correlations": {
+        "Possession Football vs Direct Football": 0.841,
+        "Possession Football vs High Pressing": 0.571,
+        "Possession Football vs Chance Creation Focus": 0.709,
+        "Direct Football vs High Pressing": 0.775,
+        "Direct Football vs Chance Creation Focus": 0.593,
+        "High Pressing vs Chance Creation Focus": 0.604
+      },
+      "top5_overlap": {
+        "Possession Football vs Direct Football": 0.8,
+        "Possession Football vs High Pressing": 0.6,
+        "Possession Football vs Chance Creation Focus": 0.6,
+        "Direct Football vs High Pressing": 0.8,
+        "Direct Football vs Chance Creation Focus": 0.6,
+        "High Pressing vs Chance Creation Focus": 0.6
+      },
+      "rankings": {
+        "Possession Football": [
+          [
+            "Arnaud Perneel",
+            140.69
+          ],
+          [
+            "Arno Vleeschouwer",
+            129.27
+          ],
+          [
+            "Ian Timmerman",
+            120.19
+          ],
+          [
+            "Emile Vanfleteren",
+            110.2
+          ],
+          [
+            "Stephane Ess\u00e9 Wukanya",
+            104.19
+          ],
+          [
+            "Seppe Vandenberghe",
+            102.78
+          ],
+          [
+            "Daan Maertens",
+            95.02
+          ],
+          [
+            "Stan Sieuw",
+            94.47
+          ],
+          [
+            "Maxime Libbenga",
+            94.35
+          ],
+          [
+            "Emiel De Groote",
+            83.69
+          ],
+          [
+            "Pieter Moens",
+            79.85
+          ],
+          [
+            "Ennio Donse",
+            66.3
+          ],
+          [
+            "Ray Morton",
+            54.66
+          ]
+        ],
+        "Direct Football": [
+          [
+            "Arnaud Perneel",
+            349.94
+          ],
+          [
+            "Arno Vleeschouwer",
+            307.33
+          ],
+          [
+            "Ian Timmerman",
+            288.73
+          ],
+          [
+            "Emile Vanfleteren",
+            218.67
+          ],
+          [
+            "Maxime Libbenga",
+            193.16
+          ],
+          [
+            "Seppe Vandenberghe",
+            191.29
+          ],
+          [
+            "Emiel De Groote",
+            180.25
+          ],
+          [
+            "Stan Sieuw",
+            113.82
+          ],
+          [
+            "Stephane Ess\u00e9 Wukanya",
+            103.51
+          ],
+          [
+            "Daan Maertens",
+            95.88
+          ],
+          [
+            "Ray Morton",
+            67.76
+          ],
+          [
+            "Ennio Donse",
+            66.36
+          ],
+          [
+            "Pieter Moens",
+            42.84
+          ]
+        ],
+        "High Pressing": [
+          [
+            "Arnaud Perneel",
+            214.88
+          ],
+          [
+            "Emile Vanfleteren",
+            183.06
+          ],
+          [
+            "Ian Timmerman",
+            173.36
+          ],
+          [
+            "Emiel De Groote",
+            163.58
+          ],
+          [
+            "Maxime Libbenga",
+            162.03
+          ],
+          [
+            "Arno Vleeschouwer",
+            161.17
+          ],
+          [
+            "Daan Maertens",
+            82.69
+          ],
+          [
+            "Seppe Vandenberghe",
+            80.36
+          ],
+          [
+            "Ennio Donse",
+            76.31
+          ],
+          [
+            "Ray Morton",
+            69.32
+          ],
+          [
+            "Stephane Ess\u00e9 Wukanya",
+            67.37
+          ],
+          [
+            "Pieter Moens",
+            61.15
+          ],
+          [
+            "Stan Sieuw",
+            56.59
+          ]
+        ],
+        "Chance Creation Focus": [
+          [
+            "Daan Maertens",
+            141.28
+          ],
+          [
+            "Arnaud Perneel",
+            121.38
+          ],
+          [
+            "Seppe Vandenberghe",
+            119.7
+          ],
+          [
+            "Ian Timmerman",
+            113.21
+          ],
+          [
+            "Emile Vanfleteren",
+            104.99
+          ],
+          [
+            "Emiel De Groote",
+            98.95
+          ],
+          [
+            "Arno Vleeschouwer",
+            96.22
+          ],
+          [
+            "Stephane Ess\u00e9 Wukanya",
+            93.9
+          ],
+          [
+            "Stan Sieuw",
+            60.19
+          ],
+          [
+            "Maxime Libbenga",
+            57.41
+          ],
+          [
+            "Ray Morton",
+            46.48
+          ],
+          [
+            "Pieter Moens",
+            46.23
+          ],
+          [
+            "Ennio Donse",
+            22.02
+          ]
+        ]
+      }
+    }
+  ],
+  "profiles": [
+    "Possession Football",
+    "Direct Football",
+    "High Pressing",
+    "Chance Creation Focus"
+  ],
+  "avg_correlations": {
+    "Possession Football vs Direct Football": 0.824,
+    "Possession Football vs High Pressing": 0.702,
+    "Possession Football vs Chance Creation Focus": 0.806,
+    "Direct Football vs High Pressing": 0.787,
+    "Direct Football vs Chance Creation Focus": 0.695,
+    "High Pressing vs Chance Creation Focus": 0.701
+  },
+  "overall_avg_correlation": 0.752,
+  "avg_top5_overlap": {
+    "Possession Football vs Direct Football": 0.667,
+    "Possession Football vs High Pressing": 0.667,
+    "Possession Football vs Chance Creation Focus": 0.667,
+    "Direct Football vs High Pressing": 0.733,
+    "Direct Football vs Chance Creation Focus": 0.667,
+    "High Pressing vs Chance Creation Focus": 0.667
+  },
+  "overall_avg_top5_overlap": 0.678,
+  "tag": "v2"
+}
