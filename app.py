@@ -49,26 +49,192 @@ def conn():
     return db.get_connection()
 
 
+# ---------------------------------------------------------------------------
+# Authentication & club isolation (Phase 1)
+# ---------------------------------------------------------------------------
+def _club():
+    """Return the club_id of the currently logged-in user (or None)."""
+    return st.session_state.get("club_id")
+
+
+def _team_ids():
+    """Return the list of team_ids the current user is restricted to, or None.
+
+    Phase 3 team-level isolation:
+    - platform_admin / club_admin -> None (no team restriction; club_id scoping
+      already limits them to their own club's data).
+    - analyst / coach -> list of team_ids they are assigned to (possibly empty,
+      meaning they can see nothing until assigned to a team).
+    """
+    role = st.session_state.get("role")
+    if role in ("platform_admin", "club_admin"):
+        return None
+    return db.get_user_team_ids(conn(), st.session_state.get("user_id"))
+
+
+def _selectable_teams():
+    """Return list of team rows the current user may upload/select data for."""
+    role = st.session_state.get("role")
+    if role in ("platform_admin", "club_admin"):
+        return db.list_teams(conn(), _club())
+    return db.get_teams_for_user(conn(), st.session_state.get("user_id"))
+
+
+def _init_auth_state():
+    """Ensure all auth-related session_state keys exist."""
+    for key, default in (
+        ("logged_in", False),
+        ("user_id", None),
+        ("username", None),
+        ("club_id", None),
+        ("role", None),
+        ("auth_view", "login"),   # 'login' | 'register'
+    ):
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+
+def do_logout():
+    """Clear the auth session and any cached, club-scoped data."""
+    for key in ("logged_in", "user_id", "username", "club_id", "role"):
+        st.session_state[key] = False if key == "logged_in" else None
+    st.session_state["auth_view"] = "login"
+    st.cache_data.clear()
+
+
+def _login_user(user):
+    """Populate session_state from a user row and seed the club's profiles."""
+    st.session_state["logged_in"] = True
+    st.session_state["user_id"] = user["id"]
+    st.session_state["username"] = user["username"]
+    st.session_state["club_id"] = user["club_id"]
+    st.session_state["role"] = user["role"]
+    db.ensure_club_seeded(conn(), user["club_id"])
+    st.cache_data.clear()
+
+
+def _password_problems(password):
+    """Return a list of strength problems (empty list == strong enough)."""
+    problems = []
+    if len(password or "") < 8:
+        problems.append("at least 8 characters")
+    if not any(ch.isalpha() for ch in (password or "")):
+        problems.append("a letter")
+    if not any(ch.isdigit() for ch in (password or "")):
+        problems.append("a number")
+    return problems
+
+
+def screen_login():
+    """Render the login screen shown before any authenticated screen."""
+    st.markdown("## ⚽ Football Impact Platform")
+    st.caption("Please sign in to continue.")
+    with st.form("login_form"):
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+    if submitted:
+        c = conn()
+        user, err = db.authenticate_full(c, (username or "").strip(), password or "")
+        if user:
+            _login_user(user)
+            st.rerun()
+        elif err == "user_inactive":
+            st.error("Your account has been deactivated. Contact your club admin.")
+        elif err == "club_inactive":
+            st.error("This club is currently inactive. Contact the platform admin.")
+        else:
+            st.error("Invalid username or password.")
+
+    st.divider()
+    st.caption("New club? Create a free trial account.")
+    if st.button("📝 Register a new club", key="goto_register",
+                 use_container_width=True):
+        st.session_state["auth_view"] = "register"
+        st.rerun()
+
+
+def screen_register():
+    """Self-service onboarding: create a new club + first club_admin user."""
+    st.markdown("## 📝 Register your club")
+    st.caption("Create a free trial account. You'll become the club admin and "
+               "can add up to 3 teams and 3 users.")
+    with st.form("register_form"):
+        club_name = st.text_input("Club name *", key="reg_club")
+        username = st.text_input("Your username *", key="reg_user")
+        email = st.text_input("Email *", key="reg_email")
+        password = st.text_input("Password *", type="password", key="reg_pw")
+        confirm = st.text_input("Confirm password *", type="password",
+                                key="reg_pw2")
+        submitted = st.form_submit_button("Create club & sign in",
+                                          type="primary")
+    if submitted:
+        c = conn()
+        club_name = (club_name or "").strip()
+        username = (username or "").strip()
+        email = (email or "").strip()
+        # ---- validation ----
+        errs = []
+        if not club_name or not username or not email:
+            errs.append("Club name, username and email are required.")
+        if "@" not in email or "." not in email:
+            errs.append("Please enter a valid email address.")
+        if password != confirm:
+            errs.append("Passwords do not match.")
+        pw_problems = _password_problems(password)
+        if pw_problems:
+            errs.append("Password must contain " + ", ".join(pw_problems) + ".")
+        if not errs and db.club_name_exists(c, club_name):
+            errs.append("That club name is already taken.")
+        if not errs and db.get_user_by_username(c, username):
+            errs.append("That username is already taken.")
+        if not errs and db.get_user_by_email(c, email):
+            errs.append("That email is already registered.")
+        if errs:
+            for e in errs:
+                st.error(e)
+        else:
+            try:
+                uid, cid = db.register_club(c, club_name, username, email,
+                                            password)
+                user = db.get_user_by_username(c, username)
+                _login_user(user)
+                st.success(f"Welcome, {username}! Your club '{club_name}' is ready.")
+                st.rerun()
+            except ValueError as ve:
+                st.error(f"Could not create club: {ve}")
+
+    st.divider()
+    if st.button("← Back to sign in", key="goto_login",
+                 use_container_width=True):
+        st.session_state["auth_view"] = "login"
+        st.rerun()
+
+
 @st.cache_data(show_spinner=False)
-def squad_metric_reference():
+def squad_metric_reference(club_id, team_ids_key=None):
     """Squad-wide per-metric normalisation reference for the drill-down radars.
 
     Reads every player's stat history once and asks impact_engine for the
-    90th-percentile reference per metric. Cached (cleared on new uploads via
-    ``st.cache_data.clear()``); read-only, no schema changes.
+    90th-percentile reference per metric. Cached per club + team scope (cleared
+    on new uploads via ``st.cache_data.clear()``); read-only, no schema changes.
+
+    ``team_ids_key`` is a hashable tuple of team_ids (or None) so the cache key
+    reflects team-level isolation for analysts/coaches.
     """
     c = conn()
+    team_ids = list(team_ids_key) if team_ids_key is not None else None
     all_stats = []
-    for p in db.list_players(c):
+    for p in db.list_players(c, club_id, team_ids=team_ids):
         if not p["appearances"]:
             continue
-        for r in db.get_player_match_history(c, p["id"]):
+        for r in db.get_player_match_history(c, p["id"], club_id, team_ids=team_ids):
             all_stats.append(r["stats"])
     return IE.metric_reference(all_stats, pct=90)
 
 
 def get_profiles(c):
-    return db.list_profiles(c)
+    return db.list_profiles(c, _club())
 
 
 def profile_selector(c, key, label="Playing Style Profile"):
@@ -95,8 +261,8 @@ def scoring_selector(c, key, label="Scoring profile"):
       {'kind': 'position', 'profile': row, 'importances': {...}}  or
       {'kind': 'legacy',   'profile': row, 'weights': {...}}
     """
-    pos_profiles = db.list_position_profiles(c)
-    style_profiles = db.list_profiles(c)
+    pos_profiles = db.list_position_profiles(c, _club())
+    style_profiles = db.list_profiles(c, _club())
     options, mapping = [], {}
     for p in pos_profiles:
         lbl = f"⚽ {p['name']}"
@@ -320,7 +486,7 @@ def _render_import_confirmation(c):
                     }
             try:
                 match_id, created, n = P.store_parsed(
-                    c, item["parsed"], overrides=overrides,
+                    c, item["parsed"], _club(), overrides=overrides,
                     session_type=session_type)
                 verb = "Imported" if created else "Re-imported (updated)"
                 log.success(f"✅ **{item['file_name']}** — {verb}: {n} players "
@@ -370,7 +536,7 @@ def screen_upload():
                     parsed = P.parse_pdf(tmp_path, original_name=uf.name)
 
                     # --- Duplicate detection (hash of raw PDF bytes) ---
-                    dupe = db.find_match_by_hash(c, parsed.get("upload_hash"))
+                    dupe = db.find_match_by_hash(c, _club(), parsed.get("upload_hash"))
                     if dupe and not override_dupes:
                         log.warning(
                             f"⚠️ **{uf.name}** — This PDF appears to have already been "
@@ -409,7 +575,7 @@ def screen_upload():
     st.divider()
 
     # Summary
-    s = db.summary_counts(c)
+    s = db.summary_counts(c, _club(), team_ids=_team_ids())
     col1, col2, col3 = st.columns(3)
     col1.metric("Matches", s["matches"])
     col2.metric("Players", s["players"])
@@ -419,7 +585,7 @@ def screen_upload():
     col3.metric("Date range", dr)
 
     st.subheader("Processed matches")
-    matches = db.list_matches(c)
+    matches = db.list_matches(c, _club(), team_ids=_team_ids())
     if not matches:
         st.info("No matches yet. Upload some PDFs above to get started.")
         return
@@ -443,7 +609,7 @@ def screen_upload():
         ids = {U.match_label(m): m["id"] for m in matches}
         sel = st.selectbox("Select match to delete", list(ids.keys()))
         if st.button("Delete match", type="secondary"):
-            db.delete_match(c, ids[sel])
+            db.delete_match(c, ids[sel], club_id=_club())
             st.success("Deleted.")
             st.rerun()
 
@@ -516,7 +682,7 @@ def _render_position_editor(c, rows):
 
         if changes:
             for pms_id, player, old_pos, new_pos in changes:
-                db.update_player_match_position(c, pms_id, new_pos)
+                db.update_player_match_position(c, pms_id, new_pos, club_id=_club())
                 # st.toast survives the rerun, so the confirmation stays
                 # visible after impact scores recalculate.
                 st.toast(f"✅ {player}: '{old_pos}' → '{new_pos}'. "
@@ -528,7 +694,7 @@ def _render_position_editor(c, rows):
 def screen_match():
     st.header("📊 Match Dashboard")
     c = conn()
-    matches = db.list_matches(c)
+    matches = db.list_matches(c, _club(), team_ids=_team_ids())
     if not matches:
         st.info("No matches available. Upload PDFs in the Upload & Overview screen.")
         return
@@ -545,7 +711,7 @@ def screen_match():
 
     # GPS / physical data indicator (read-only; impact pipeline unchanged),
     # condensed into a single inline badge instead of a full-width banner.
-    gps_rows = db.get_physical_data(c, session_type="match", match_id=match["id"])
+    gps_rows = db.get_physical_data(c, _club(), session_type="match", match_id=match["id"], team_ids=_team_ids())
     if gps_rows:
         n_players = len({r["player_name"] for r in gps_rows})
         gps_badge = f"✅ GPS: {len(gps_rows)} records · {n_players} spelers"
@@ -561,7 +727,7 @@ def screen_match():
         f"🔢 **{score}**  ·  🏆 **{result}**  ·  {gps_badge}"
     )
 
-    player_stats = db.get_match_player_stats(c, match["id"])
+    player_stats = db.get_match_player_stats(c, match["id"], _club())
     rows = score_match_rows(player_stats, scorer)
     if not rows:
         st.warning("No player stats for this match.")
@@ -763,7 +929,7 @@ def _render_player_physical_profile(c, pid, name):
     data linked.
     """
     st.subheader("🏃 Physical Profile")
-    agg = db.get_player_physical_aggregate(c, pid)
+    agg = db.get_player_physical_aggregate(c, pid, _club())
     if agg is None:
         st.info("No physical data available")
         return
@@ -818,7 +984,7 @@ def _render_match_player_physical(c, rows, match_id):
     n_with_data = 0
     for r in sorted(rows, key=lambda x: x["impact"]["total_impact"],
                     reverse=True):
-        phys = db.get_player_physical_for_match(c, r.get("player_id"), match_id)
+        phys = db.get_player_physical_for_match(c, r.get("player_id"), match_id, _club())
         entry = {
             "Player": r["player_name"],
             "Pos": r.get("effective_position") or r["position"],
@@ -907,7 +1073,7 @@ def _render_match_physical(gps_rows):
 def screen_player():
     st.header("👤 Player Profile")
     c = conn()
-    players = [p for p in db.list_players(c) if p["appearances"] > 0]
+    players = [p for p in db.list_players(c, _club(), team_ids=_team_ids()) if p["appearances"] > 0]
     if not players:
         st.info("No players available. Upload PDFs first.")
         return
@@ -918,7 +1084,7 @@ def screen_player():
 
     scorer = scoring_selector(c, key="player_profile")
 
-    full_history = db.get_player_match_history(c, pid)
+    full_history = db.get_player_match_history(c, pid, _club(), team_ids=_team_ids())
 
     # --- BUG 4 fix: allow viewing the whole career OR a single match ---------
     # Career Overview is the default (unchanged behaviour). Single Match filters
@@ -990,7 +1156,8 @@ def screen_player():
 
     is_keeper = (summary.get("avg_position") == "Goalkeeper"
                  or IE.player_has_goalkeeping(history))
-    reference = squad_metric_reference()
+    _tids = _team_ids()
+    reference = squad_metric_reference(_club(), tuple(_tids) if _tids is not None else None)
 
     # --- Verbetering #2: automatic strengths & weaknesses summary --------
     st.subheader("💪 Sterktes & Werkpunten")
@@ -1131,7 +1298,7 @@ def screen_player():
 def screen_comparison():
     st.header("⚖️ Player Comparison")
     c = conn()
-    players = [p for p in db.list_players(c) if p["appearances"] > 0]
+    players = [p for p in db.list_players(c, _club(), team_ids=_team_ids()) if p["appearances"] > 0]
     if len(players) < 2:
         st.info("Need at least 2 players with data to compare.")
         return
@@ -1149,7 +1316,7 @@ def screen_comparison():
     for label in sel:
         pid = pmap[label]
         name = next(p["name"] for p in players if p["id"] == pid)
-        history = db.get_player_match_history(c, pid)
+        history = db.get_player_match_history(c, pid, _club(), team_ids=_team_ids())
         summaries[name] = career_sum(history, scorer)
 
     # Side-by-side table
@@ -1243,7 +1410,7 @@ def screen_comparison():
 def screen_evolution():
     st.header("📈 Evolution Dashboard")
     c = conn()
-    players = [p for p in db.list_players(c) if p["appearances"] > 0]
+    players = [p for p in db.list_players(c, _club(), team_ids=_team_ids()) if p["appearances"] > 0]
     if not players:
         st.info("No players available. Upload PDFs first.")
         return
@@ -1254,7 +1421,7 @@ def screen_evolution():
 
     scorer = scoring_selector(c, key="evo_profile")
 
-    history = db.get_player_match_history(c, pid)
+    history = db.get_player_match_history(c, pid, _club(), team_ids=_team_ids())
     rows = score_match_rows(history, scorer)
     if len(rows) < 1:
         st.info("No match data for this player.")
@@ -1336,7 +1503,7 @@ def _position_profile_editor(c):
                "position**. The same statistics matter differently for a "
                "goalkeeper than for a striker. " + _SCALE_HELP)
 
-    profiles = db.list_position_profiles(c)
+    profiles = db.list_position_profiles(c, _club())
     if not profiles:
         st.warning("No position profiles available.")
         return
@@ -1396,7 +1563,7 @@ def _position_profile_editor(c):
                     st.error("Please enter a name.")
                 else:
                     try:
-                        club_id = db.get_default_club_id(c)
+                        club_id = _club()
                         db.create_position_profile(
                             c, club_id, new_name.strip(), new_desc, importances)
                         st.success(f"Created '{new_name}'.")
@@ -1455,7 +1622,7 @@ def _legacy_profile_editor(c):
                 if not new_name.strip():
                     st.error("Please enter a name.")
                 else:
-                    club_id = db.get_default_club_id(c)
+                    club_id = _club()
                     try:
                         db.create_profile(c, club_id, new_name.strip(), new_desc,
                                           db.get_profile_weights(c, prof["id"]))
@@ -1493,7 +1660,7 @@ def _confirm_delete_match(match):
     if col_confirm.button("Confirm delete", type="primary",
                           use_container_width=True, key="dm_confirm_match"):
         try:
-            counts = db.delete_match(conn(), match["id"])
+            counts = db.delete_match(conn(), match["id"], club_id=_club())
             st.cache_data.clear()
             st.session_state["_dm_flash"] = (
                 "success",
@@ -1520,7 +1687,7 @@ def _confirm_delete_source(group):
     if col_confirm.button("Confirm delete", type="primary",
                           use_container_width=True, key="dm_confirm_src"):
         try:
-            counts = db.delete_matches_by_source(conn(), group["source_file"])
+            counts = db.delete_matches_by_source(conn(), group["source_file"], club_id=_club())
             st.cache_data.clear()
             st.session_state["_dm_flash"] = (
                 "success",
@@ -1547,8 +1714,8 @@ def screen_data_management():
         kind, msg = flash
         (st.success if kind == "success" else st.error)(msg)
 
-    s = db.summary_counts(c)
-    history = db.list_upload_history(c)
+    s = db.summary_counts(c, _club(), team_ids=_team_ids())
+    history = db.list_upload_history(c, _club(), team_ids=_team_ids())
     col1, col2, col3 = st.columns(3)
     col1.metric("PDF sources", len(history))
     col2.metric("Matches", s["matches"])
@@ -1582,7 +1749,7 @@ def screen_data_management():
     # ---------------- Section B: Match Overview ----------------
     st.subheader("⚽ Match Overview")
     st.caption("Every imported match with its metadata and source PDF.")
-    matches = db.list_matches_detailed(c)
+    matches = db.list_matches_detailed(c, _club(), team_ids=_team_ids())
     header = st.columns([0.6, 1.4, 2, 2, 1, 1, 2.2, 1.2])
     for col, label in zip(
         header,
@@ -1623,7 +1790,7 @@ def _render_physical_sessions_management(c):
                "player stats) is never affected. Unlinking detaches a session "
                "from its match.")
 
-    sessions = db.get_all_physical_sessions(c)
+    sessions = db.get_all_physical_sessions(c, _club(), team_ids=_team_ids())
     if not sessions:
         st.info("No physical sessions yet. Upload Catapult CSV or Game Report "
                 "files in the Physical Data screen.")
@@ -1678,7 +1845,7 @@ def _render_physical_sessions_management(c):
                 uc = st.columns([1, 1, 3])
                 if uc[0].button("✅ Yes, unlink", key=f"dm_dounlink_{skey}"):
                     try:
-                        n = db.unlink_physical_session(c, s["session_name"])
+                        n = db.unlink_physical_session(c, s["session_name"], club_id=_club())
                         st.cache_data.clear()
                         st.session_state.pop(f"dm_confirm_unlink_{skey}", None)
                         st.session_state["_dm_flash"] = (
@@ -1705,7 +1872,7 @@ def _render_physical_sessions_management(c):
                 dc = st.columns([1, 1, 3])
                 if dc[0].button("✅ Yes, delete", key=f"dm_dodel_{skey}"):
                     try:
-                        n = db.delete_physical_session(c, s["session_name"])
+                        n = db.delete_physical_session(c, s["session_name"], club_id=_club())
                         st.cache_data.clear()
                         st.session_state.pop(f"dm_confirm_del_{skey}", None)
                         st.session_state["_dm_flash"] = (
@@ -1739,7 +1906,7 @@ def screen_physical():
                "upload, controleer, bewaar en visualiseer.")
 
     c = conn()
-    counts = db.physical_summary_counts(c)
+    counts = db.physical_summary_counts(c, _club(), team_ids=_team_ids())
     h1, h2, h3 = st.columns(3)
     h1.metric("Records", counts["rows"])
     h2.metric("Sessies", counts["sessions"])
@@ -1837,7 +2004,7 @@ def screen_physical():
             if selected_type == "match":
                 st.markdown("### 🏆 Wedstrijddetails")
                 if file_date:
-                    matches_on_date = db.get_matches_for_date(c, file_date)
+                    matches_on_date = db.get_matches_for_date(c, file_date, club_id=_club(), team_ids=_team_ids())
                     if matches_on_date:
                         st.write(f"{len(matches_on_date)} wedstrijd(en) "
                                  f"gevonden op **{file_date}**:")
@@ -1889,6 +2056,26 @@ def screen_physical():
 
             st.divider()
 
+            # ---- STAP 4b: TEAM-KEUZE (Phase 3 team-isolatie) ----
+            # Voor wedstrijd-sessies wordt het team afgeleid van de gekoppelde
+            # wedstrijd; voor training/ongelinkt kiest de gebruiker zelf een team
+            # zodat de data correct toegewezen blijft.
+            upload_team_id = None
+            if selected_type != "match":
+                _teams = _selectable_teams()
+                if not _teams:
+                    st.warning("⚠️ Je bent nog niet aan een team toegewezen. "
+                               "Vraag je club-beheerder om je toe te wijzen "
+                               "voordat je data uploadt.")
+                else:
+                    st.markdown("### 👥 Team")
+                    _team_labels = {f"{t['name']}": t["id"] for t in _teams}
+                    _team_choice = st.selectbox(
+                        "Voor welk team is deze sessie?",
+                        list(_team_labels.keys()), key="phys_team_selector")
+                    upload_team_id = _team_labels[_team_choice]
+                st.divider()
+
             # ---- STAP 5: CONFIRMATION ----
             st.markdown("### ✅ Bevestiging")
             display_name = session_name or report.get("session_name") \
@@ -1910,8 +2097,9 @@ def screen_physical():
                          key="phys_save_btn"):
                 try:
                     res = db.save_physical_data(
-                        c, df, match_id=match_id, source_filename=uf.name,
-                        session_type=selected_type, session_name=session_name)
+                        c, _club(), df, match_id=match_id, source_filename=uf.name,
+                        session_type=selected_type, session_name=session_name,
+                        team_id=upload_team_id)
                     st.cache_data.clear()
                     st.success(
                         f"✅ Opgeslagen als **{type_disp}**: {res['inserted']} "
@@ -1927,7 +2115,7 @@ def screen_physical():
 
     # ---------------- Section B: Sessions & Visualisation ----------------
     st.subheader("📊 Sessies & Visualisatie")
-    sessions = db.list_physical_sessions(c)
+    sessions = db.list_physical_sessions(c, _club(), team_ids=_team_ids())
     if not sessions:
         st.info("Nog geen fysieke data opgeslagen. Upload hierboven een "
                 "Catapult-CSV of wedstrijd-XLSX om te beginnen.")
@@ -1965,7 +2153,7 @@ def screen_physical():
         st.info("Geen sessies voor de geselecteerde types.")
         return
 
-    players = db.list_physical_players(c)
+    players = db.list_physical_players(c, _club(), team_ids=_team_ids())
     f1, f2, f3 = st.columns(3)
     sess_labels = {"— Alle sessies (gefilterd) —": None}
     for s in filtered_sessions:
@@ -1991,11 +2179,11 @@ def screen_physical():
     if session_name is None:
         allowed_names = {s["session_name"] for s in filtered_sessions}
         rows = [r for r in db.get_physical_data(
-                    c, player_name=player_name, period=period)
+                    c, _club(), player_name=player_name, period=period, team_ids=_team_ids())
                 if r["session_name"] in allowed_names]
     else:
-        rows = db.get_physical_data(c, player_name=player_name,
-                                    session_name=session_name, period=period)
+        rows = db.get_physical_data(c, _club(), player_name=player_name,
+                                    session_name=session_name, period=period, team_ids=_team_ids())
     pdf_ = _physical_rows_to_df(rows)
     if pdf_.empty:
         st.info("Geen records voor deze selectie.")
@@ -2111,7 +2299,8 @@ def screen_physical():
                                  use_container_width=True):
                     try:
                         n = db.unlink_physical_session(
-                            c, s["session_name"], s["data_source"])
+                            c, s["session_name"], s["data_source"],
+                            club_id=_club())
                         st.cache_data.clear()
                         st.success(f"✅ Sessie ontkoppeld ({n} records → "
                                    "ongelinkt).")
@@ -2129,8 +2318,8 @@ def screen_physical():
                 st.markdown("---")
                 st.markdown("**🔗 Koppel aan een wedstrijd:**")
                 date_str = s["match_date"]
-                matches = (db.get_matches_for_date(c, date_str, window_days=3)
-                           if date_str else db.list_matches(c))
+                matches = (db.get_matches_for_date(c, date_str, window_days=3, club_id=_club(), team_ids=_team_ids())
+                           if date_str else db.list_matches(c, _club(), team_ids=_team_ids()))
                 if matches:
                     mopts = []
                     for m in matches:
@@ -2148,7 +2337,8 @@ def screen_physical():
                         try:
                             n = db.link_physical_session_to_match(
                                 c, s["session_name"], s["data_source"],
-                                match_id, new_session_name=new_name)
+                                match_id, new_session_name=new_name,
+                                club_id=_club())
                             st.cache_data.clear()
                             st.session_state.pop(f"show_link_{skey}", None)
                             st.success(f"✅ {n} records gekoppeld aan wedstrijd.")
@@ -2174,7 +2364,8 @@ def screen_physical():
                 dc = st.columns([1, 1, 3])
                 if dc[0].button("✅ Ja, verwijderen", key=f"dodel_{skey}"):
                     n = db.delete_physical_session(c, s["session_name"],
-                                                   s["data_source"])
+                                                   s["data_source"],
+                                                   club_id=_club())
                     st.cache_data.clear()
                     st.session_state.pop(f"confirm_del_{skey}", None)
                     st.success(f"{n} records verwijderd uit "
@@ -2183,6 +2374,280 @@ def screen_physical():
                 if dc[1].button("❌ Annuleer", key=f"canceldel_{skey}"):
                     st.session_state.pop(f"confirm_del_{skey}", None)
                     st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Club Management (Phase 2) — club_admin & platform_admin
+# ---------------------------------------------------------------------------
+_LIMIT_MSG = ("Limiet bereikt. Upgrade nodig om meer {what} toe te voegen.")
+
+
+def _role():
+    return st.session_state.get("role")
+
+
+def _is_platform_admin():
+    return _role() == "platform_admin"
+
+
+def _is_club_admin():
+    return _role() == "club_admin"
+
+
+def _render_club_panel(c, club_id):
+    """Render the management panel (info + teams + users) for one club."""
+    club = db.get_club(c, club_id)
+    if club is None:
+        st.error("Club not found.")
+        return
+
+    # ---- A. Club Info ----
+    st.markdown(f"### 🏟️ {club['name']}")
+    user_count = db.get_club_user_count(c, club_id)
+    team_count = db.get_club_team_count(c, club_id)
+    ci = st.columns(4)
+    ci[0].metric("Abonnement", club["subscription_status"])
+    ci[1].metric("Gebruikers", f"{user_count} / {club['max_users']}")
+    ci[2].metric("Teams", f"{team_count} / {club['max_teams']}")
+    ci[3].metric("Status", "Actief" if club["is_active"] else "Inactief")
+
+    # ---- Platform-admin controls for this club ----
+    if _is_platform_admin():
+        with st.expander("⚙️ Platform-beheer (limieten & status)"):
+            with st.form(f"limits_{club_id}"):
+                lc = st.columns(3)
+                new_max_users = lc[0].number_input(
+                    "Max gebruikers", min_value=1, max_value=999,
+                    value=int(club["max_users"]), step=1)
+                new_max_teams = lc[1].number_input(
+                    "Max teams", min_value=1, max_value=999,
+                    value=int(club["max_teams"]), step=1)
+                new_status = lc[2].selectbox(
+                    "Abonnement",
+                    ["trial", "active", "suspended", "cancelled"],
+                    index=["trial", "active", "suspended", "cancelled"].index(
+                        club["subscription_status"])
+                    if club["subscription_status"] in
+                    ["trial", "active", "suspended", "cancelled"] else 0)
+                if st.form_submit_button("💾 Limieten opslaan"):
+                    db.update_club_limits(c, club_id, new_max_users,
+                                          new_max_teams)
+                    db.update_club_subscription(c, club_id, new_status)
+                    st.success("Limieten bijgewerkt.")
+                    st.rerun()
+            toggle_label = ("🚫 Club deactiveren" if club["is_active"]
+                            else "✅ Club activeren")
+            if st.button(toggle_label, key=f"toggle_club_{club_id}"):
+                db.set_club_active(c, club_id, not club["is_active"])
+                st.success("Clubstatus bijgewerkt.")
+                st.rerun()
+
+    st.divider()
+
+    # ---- B. Teams Management ----
+    st.markdown("#### ⚽ Teams")
+    teams = db.list_teams(c, club_id)
+    if teams:
+        st.dataframe(
+            pd.DataFrame([
+                {"Team": t["name"], "Leeftijdsgroep": t["age_group"] or "—"}
+                for t in teams
+            ]),
+            use_container_width=True, hide_index=True)
+    else:
+        st.info("Nog geen teams aangemaakt.")
+
+    at_team_limit = not db.can_add_team(c, club_id)
+    if at_team_limit:
+        st.warning("⚠️ " + _LIMIT_MSG.format(what="teams"))
+    with st.form(f"add_team_{club_id}", clear_on_submit=True):
+        tc = st.columns([2, 1, 1])
+        t_name = tc[0].text_input("Teamnaam")
+        t_age = tc[1].text_input("Leeftijdsgroep (optioneel)")
+        tc[2].markdown("&nbsp;")
+        add_team = tc[2].form_submit_button("➕ Team toevoegen",
+                                            disabled=at_team_limit)
+    if add_team:
+        try:
+            db.create_team(c, club_id, t_name, t_age)
+            st.success(f"Team '{t_name}' toegevoegd.")
+            st.rerun()
+        except ValueError as ve:
+            msg = str(ve)
+            if msg == "limit_reached":
+                st.error(_LIMIT_MSG.format(what="teams"))
+            elif msg == "duplicate":
+                st.error("Er bestaat al een team met deze naam/leeftijdsgroep.")
+            elif msg == "empty_name":
+                st.error("Teamnaam is verplicht.")
+            else:
+                st.error(f"Kon team niet toevoegen: {msg}")
+
+    st.divider()
+
+    # ---- C. Users Management ----
+    st.markdown("#### 👥 Gebruikers")
+    users = db.list_users_for_club(c, club_id)
+    if users:
+        st.dataframe(
+            pd.DataFrame([
+                {"Gebruiker": u["username"],
+                 "Email": u["email"] or "—",
+                 "Rol": u["role"],
+                 "Team": u["team_name"] or "—",
+                 "Status": "Actief" if u["is_active"] else "Inactief"}
+                for u in users
+            ]),
+            use_container_width=True, hide_index=True)
+    else:
+        st.info("Nog geen gebruikers.")
+
+    # Deactivate / reactivate users (not yourself).
+    me = st.session_state.get("user_id")
+    for u in users:
+        if u["id"] == me:
+            continue
+        cols = st.columns([3, 1])
+        cols[0].markdown(
+            f"**{u['username']}** · {u['role']} · "
+            f"{'🟢 Actief' if u['is_active'] else '🔴 Inactief'}")
+        btn_label = "Deactiveren" if u["is_active"] else "Activeren"
+        if cols[1].button(btn_label, key=f"toggle_user_{u['id']}"):
+            db.set_user_active(c, u["id"], not u["is_active"], club_id=club_id)
+            st.success(f"Gebruiker '{u['username']}' bijgewerkt.")
+            st.rerun()
+
+    at_user_limit = not db.can_add_user(c, club_id)
+    if at_user_limit:
+        st.warning("⚠️ " + _LIMIT_MSG.format(what="users"))
+    teams_for_select = db.list_teams(c, club_id)
+    team_opts = {"— Geen team —": None}
+    for t in teams_for_select:
+        label = t["name"] + (f" ({t['age_group']})" if t["age_group"] else "")
+        team_opts[label] = t["id"]
+    with st.form(f"add_user_{club_id}", clear_on_submit=True):
+        uc = st.columns(2)
+        u_name = uc[0].text_input("Gebruikersnaam")
+        u_email = uc[1].text_input("Email")
+        uc2 = st.columns(3)
+        u_pw = uc2[0].text_input("Wachtwoord", type="password")
+        u_role = uc2[1].selectbox("Rol", list(db.CLUB_ASSIGNABLE_ROLES))
+        u_team_label = uc2[2].selectbox("Team (optioneel)",
+                                        list(team_opts.keys()))
+        add_user = st.form_submit_button("➕ Gebruiker toevoegen",
+                                         disabled=at_user_limit)
+    if add_user:
+        pw_problems = _password_problems(u_pw)
+        if pw_problems:
+            st.error("Wachtwoord moet bevatten: " + ", ".join(pw_problems) + ".")
+        else:
+            try:
+                db.create_club_user(
+                    c, club_id, u_name, u_pw, role=u_role,
+                    email=u_email, team_id=team_opts[u_team_label])
+                st.success(f"Gebruiker '{u_name}' toegevoegd.")
+                st.rerun()
+            except ValueError as ve:
+                msg = str(ve)
+                mapping = {
+                    "limit_reached": _LIMIT_MSG.format(what="users"),
+                    "username_taken": "Die gebruikersnaam bestaat al.",
+                    "email_taken": "Dat emailadres is al geregistreerd.",
+                    "empty": "Gebruikersnaam en wachtwoord zijn verplicht.",
+                    "bad_role": "Ongeldige rol.",
+                }
+                st.error(mapping.get(msg, f"Kon gebruiker niet toevoegen: {msg}"))
+
+    st.divider()
+
+    # ---- D. Team Assignments (Phase 3) ----
+    # Analysts & coaches only see data for the teams they are assigned to.
+    # club_admin (and platform_admin) manage those assignments here.
+    st.markdown("#### 🔐 Team-toewijzingen")
+    st.caption("Analisten en coaches zien alleen data van de teams waaraan ze "
+               "zijn toegewezen. Platform- en clubbeheerders zien automatisch "
+               "alle teams van de club.")
+
+    teams_for_assign = db.list_teams(c, club_id)
+    assignable_users = [u for u in users
+                        if u["role"] in db.CLUB_ASSIGNABLE_ROLES]
+
+    if not teams_for_assign:
+        st.info("Maak eerst een team aan voordat je toewijzingen beheert.")
+    elif not assignable_users:
+        st.info("Nog geen analisten of coaches om toe te wijzen.")
+    else:
+        # Overview table: User | Role | Assigned Teams
+        team_name_by_id = {
+            t["id"]: t["name"] + (f" ({t['age_group']})" if t["age_group"] else "")
+            for t in teams_for_assign
+        }
+        overview = []
+        for u in assignable_users:
+            assigned = db.list_user_team_ids(c, u["id"])
+            overview.append({
+                "Gebruiker": u["username"],
+                "Rol": u["role"],
+                "Toegewezen teams": ", ".join(
+                    team_name_by_id.get(tid, str(tid)) for tid in assigned
+                ) or "— geen —",
+            })
+        st.dataframe(pd.DataFrame(overview),
+                     use_container_width=True, hide_index=True)
+
+        # Per-user multiselect editor.
+        team_label_to_id = {lbl: tid for tid, lbl in team_name_by_id.items()}
+        for u in assignable_users:
+            current_ids = set(db.list_user_team_ids(c, u["id"]))
+            current_labels = [lbl for lbl, tid in team_label_to_id.items()
+                              if tid in current_ids]
+            with st.form(f"assign_teams_{u['id']}", clear_on_submit=False):
+                st.markdown(f"**{u['username']}** · {u['role']}")
+                chosen = st.multiselect(
+                    "Teams", list(team_label_to_id.keys()),
+                    default=current_labels,
+                    key=f"assign_ms_{u['id']}")
+                if st.form_submit_button("💾 Toewijzingen opslaan"):
+                    chosen_ids = [team_label_to_id[l] for l in chosen]
+                    db.set_user_team_assignments(c, u["id"], chosen_ids)
+                    st.success(f"Team-toewijzingen voor '{u['username']}' "
+                               "bijgewerkt.")
+                    st.rerun()
+
+
+def screen_club_management():
+    """Club management panel — club_admin (own club) / platform_admin (all)."""
+    if not (_is_club_admin() or _is_platform_admin()):
+        st.error("⛔ Je hebt geen toegang tot clubbeheer.")
+        return
+
+    st.title("🏛️ Clubbeheer")
+    c = conn()
+
+    if _is_platform_admin():
+        clubs = db.list_clubs(c)
+        # Platform-wide overview.
+        with st.expander("📊 Platform-overzicht (alle clubs)", expanded=False):
+            st.dataframe(
+                pd.DataFrame([
+                    {"Club": cl["name"],
+                     "Abonnement": cl["subscription_status"],
+                     "Gebruikers": f"{cl['user_count']} / {cl['max_users']}",
+                     "Teams": f"{cl['team_count']} / {cl['max_teams']}",
+                     "Status": "Actief" if cl["is_active"] else "Inactief"}
+                    for cl in clubs
+                ]),
+                use_container_width=True, hide_index=True)
+        # Club selector.
+        label_to_id = {
+            f"{cl['name']} (id={cl['id']})": cl["id"] for cl in clubs
+        }
+        sel = st.selectbox("Selecteer een club", list(label_to_id.keys()))
+        st.divider()
+        _render_club_panel(c, label_to_id[sel])
+    else:
+        # club_admin → own club only.
+        _render_club_panel(c, _club())
 
 
 # ---------------------------------------------------------------------------
@@ -2201,13 +2666,42 @@ SCREENS = {
 
 
 def main():
+    _init_auth_state()
+
+    # Gate the whole application behind authentication.
+    if not st.session_state.get("logged_in"):
+        if st.session_state.get("auth_view") == "register":
+            screen_register()
+        else:
+            screen_login()
+        return
+
     st.sidebar.title("⚽ Impact Platform")
     st.sidebar.caption("Turn SciSports reports into coaching insights.")
-    choice = st.sidebar.radio("Navigate", list(SCREENS.keys()))
+
+    # Logged-in user info + logout.
+    club = db.get_club(conn(), _club())
+    club_name = club["name"] if club else "—"
+    st.sidebar.markdown(
+        f"**👤 {st.session_state.get('username')}**  \n"
+        f"🏟️ {club_name}  \n"
+        f"🔑 {st.session_state.get('role')}"
+    )
+    if st.sidebar.button("Log out", use_container_width=True):
+        do_logout()
+        st.rerun()
+    st.sidebar.divider()
+
+    # Build the navigation map; club admins & platform admins get Club Management.
+    screens = dict(SCREENS)
+    if _is_club_admin() or _is_platform_admin():
+        screens["🏛️ Club Management"] = screen_club_management
+
+    choice = st.sidebar.radio("Navigate", list(screens.keys()))
     st.sidebar.divider()
     st.sidebar.caption("Impact Framework v2.0 — 6 categories, 20 positions, "
                        "position-based profiles.")
-    SCREENS[choice]()
+    screens[choice]()
 
 
 if __name__ == "__main__":

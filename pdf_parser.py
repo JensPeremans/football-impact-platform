@@ -428,8 +428,11 @@ def parse_pdf(file_path, original_name=None):
     }
 
 
-def store_parsed(conn, parsed, overrides=None, session_type="match"):
+def store_parsed(conn, parsed, club_id, overrides=None, session_type="match"):
     """Persist a parsed PDF into the database. Returns (match_id, created_bool, n_players).
+
+    All created rows are tagged with ``club_id`` so the data is isolated to the
+    uploading user's club.
 
     `overrides` (optional) is a dict keyed by player name with coach-confirmed values:
         {player_name: {"position": str, "status": str, "came_on_as": str|None}}
@@ -442,15 +445,15 @@ def store_parsed(conn, parsed, overrides=None, session_type="match"):
     # opponent = away team (this is the [home] variant => our team is home)
     opponent = cover.get("away_team") or "Unknown"
 
-    team_id = db.get_or_create_team(conn, team_name, age_group)
+    team_id = db.get_or_create_team(conn, club_id, team_name, age_group)
 
-    existing = db.find_match(conn, team_id, opponent, cover["match_date"])
+    existing = db.find_match(conn, club_id, team_id, opponent, cover["match_date"])
     if existing:
         # Replace existing data for idempotent re-uploads
-        db.delete_match(conn, existing["id"])
+        db.delete_match(conn, existing["id"], club_id=club_id)
 
     match_id = db.create_match(
-        conn, team_id, opponent, cover["match_date"],
+        conn, club_id, team_id, opponent, cover["match_date"],
         cover.get("home_score"), cover.get("away_score"),
         is_home=True, season=parsed["season"], source_file=parsed["source_file"],
         upload_hash=parsed.get("upload_hash"), session_type=session_type,
@@ -458,14 +461,14 @@ def store_parsed(conn, parsed, overrides=None, session_type="match"):
 
     n = 0
     for p in parsed["players"]:
-        player_id = db.get_or_create_player(conn, p["name"])
+        player_id = db.get_or_create_player(conn, club_id, p["name"], team_id=team_id)
         minutes = p["stats"].get("minutes_played")
         ov = overrides.get(p["name"], {})
         position = ov.get("position") or p["position"]
         status = ov.get("status") or "Starter"
         came_on_as = ov.get("came_on_as") or None
         pms_id = db.upsert_player_match_stats(
-            conn, match_id, player_id, position, minutes,
+            conn, club_id, match_id, player_id, position, minutes,
             status=status, came_on_as=came_on_as,
         )
         db.save_stat_values(conn, pms_id, p["stats"])

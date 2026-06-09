@@ -10,6 +10,8 @@ import os
 import sqlite3
 from datetime import datetime
 
+import bcrypt
+
 import metrics as M
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "football_impact.db")
@@ -30,9 +32,32 @@ def get_connection(db_path=DB_PATH):
 # ---------------------------------------------------------------------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clubs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE,
-    created_at  TEXT NOT NULL
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                TEXT NOT NULL UNIQUE,
+    created_at          TEXT NOT NULL,
+    -- Phase 2 — self-service onboarding, subscription limits.
+    subscription_status TEXT NOT NULL DEFAULT 'trial',
+    max_users           INTEGER NOT NULL DEFAULT 3,
+    max_teams           INTEGER NOT NULL DEFAULT 3,
+    is_active           INTEGER NOT NULL DEFAULT 1
+);
+
+-- Phase 1 — authentication & multi-tenancy. Each user belongs to exactly one
+-- club; all data access is scoped to the user's club_id (see query helpers).
+-- Phase 2 — roles: platform_admin | club_admin | analyst | coach; unique
+-- email; per-user active flag.
+-- Phase 3 — team assignments moved to the user_team_assignments junction table
+-- (many-to-many), so users no longer carry a single team_id column.
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    club_id       INTEGER NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'coach',
+    created_at    TEXT NOT NULL,
+    email         TEXT UNIQUE,
+    is_active     INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS style_profiles (
@@ -58,20 +83,28 @@ CREATE TABLE IF NOT EXISTS metric_weights (
 
 CREATE TABLE IF NOT EXISTS teams (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    club_id     INTEGER NOT NULL,
     name        TEXT NOT NULL,
     age_group   TEXT,
     created_at  TEXT NOT NULL,
-    UNIQUE (name, age_group)
+    FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
+    UNIQUE (club_id, name, age_group)
 );
 
 CREATE TABLE IF NOT EXISTS players (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT NOT NULL UNIQUE,
-    created_at  TEXT NOT NULL
+    club_id     INTEGER NOT NULL,
+    team_id     INTEGER,                       -- Phase 3 — team ownership
+    name        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE SET NULL,
+    UNIQUE (club_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS matches (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    club_id     INTEGER NOT NULL,
     team_id     INTEGER NOT NULL,
     opponent    TEXT NOT NULL,
     match_date  TEXT NOT NULL,
@@ -83,12 +116,14 @@ CREATE TABLE IF NOT EXISTS matches (
     upload_hash TEXT,
     session_type TEXT NOT NULL DEFAULT 'match',
     created_at  TEXT NOT NULL,
+    FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
     FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
     UNIQUE (team_id, opponent, match_date)
 );
 
 CREATE TABLE IF NOT EXISTS player_match_stats (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    club_id         INTEGER NOT NULL,
     match_id        INTEGER NOT NULL,
     player_id       INTEGER NOT NULL,
     position        TEXT,
@@ -96,6 +131,7 @@ CREATE TABLE IF NOT EXISTS player_match_stats (
     came_on_as      TEXT,
     minutes_played  REAL,
     created_at      TEXT NOT NULL,
+    FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
     FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE CASCADE,
     FOREIGN KEY (player_id) REFERENCES players(id) ON DELETE CASCADE,
     UNIQUE (match_id, player_id)
@@ -136,6 +172,8 @@ CREATE TABLE IF NOT EXISTS stat_values (
 
 CREATE TABLE IF NOT EXISTS physical_data (
     id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+    club_id                         INTEGER NOT NULL,
+    team_id                         INTEGER,            -- Phase 3 — team ownership
     player_id                       INTEGER,
     match_id                        INTEGER,            -- optional link to a match (session)
     player_name                     TEXT,               -- as parsed (kept for standalone data)
@@ -179,11 +217,29 @@ CREATE TABLE IF NOT EXISTS physical_data (
     raw_data                        TEXT,               -- JSON of the original row
     -- session classification: 'match' | 'training' | 'unlinked'
     session_type                    TEXT NOT NULL DEFAULT 'unlinked',
+    FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE SET NULL,
     FOREIGN KEY (player_id) REFERENCES players(id),
     FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE SET NULL,
-    UNIQUE (player_name, session_name, period, data_source)
+    UNIQUE (club_id, player_name, session_name, period, data_source)
 );
 
+-- Phase 3 — many-to-many user↔team assignments. analyst/coach users only see
+-- data for the teams they are assigned to here.
+CREATE TABLE IF NOT EXISTS user_team_assignments (
+    assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    team_id       INTEGER NOT NULL,
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
+    UNIQUE (user_id, team_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_uta_user ON user_team_assignments(user_id);
+CREATE INDEX IF NOT EXISTS idx_uta_team ON user_team_assignments(team_id);
+CREATE INDEX IF NOT EXISTS idx_players_team   ON players(team_id);
+CREATE INDEX IF NOT EXISTS idx_physical_team  ON physical_data(team_id);
 CREATE INDEX IF NOT EXISTS idx_physical_player  ON physical_data(player_id);
 CREATE INDEX IF NOT EXISTS idx_physical_match   ON physical_data(match_id);
 CREATE INDEX IF NOT EXISTS idx_physical_date    ON physical_data(match_date);
@@ -199,21 +255,40 @@ CREATE INDEX IF NOT EXISTS idx_sv_metric      ON stat_values(metric_key);
 CREATE INDEX IF NOT EXISTS idx_weights_profile ON metric_weights(profile_id);
 """
 
+# Phase 1 — club isolation indexes. Kept separate from SCHEMA because they
+# reference the club_id columns, which legacy databases only gain *after*
+# _migrate_club_isolation runs. Applied once columns are guaranteed present.
+CLUB_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_teams_club    ON teams(club_id);
+CREATE INDEX IF NOT EXISTS idx_players_club  ON players(club_id);
+CREATE INDEX IF NOT EXISTS idx_matches_club  ON matches(club_id);
+CREATE INDEX IF NOT EXISTS idx_pms_club      ON player_match_stats(club_id);
+CREATE INDEX IF NOT EXISTS idx_physical_club ON physical_data(club_id);
+CREATE INDEX IF NOT EXISTS idx_users_club    ON users(club_id);
+"""
+
 
 def _now():
     return datetime.utcnow().isoformat(timespec="seconds")
 
 
 def init_db(db_path=DB_PATH):
-    """Create schema and seed default club + 4 style profiles (idempotent)."""
+    """Create schema and seed default club + admin user + profiles (idempotent)."""
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA)
         conn.commit()
         _migrate(conn)
+        # Re-run the schema so any indexes dropped during a table rebuild in
+        # _migrate are restored (CREATE ... IF NOT EXISTS makes this safe).
+        conn.executescript(SCHEMA)
+        # club_id columns are guaranteed present now → safe to add their indexes.
+        conn.executescript(CLUB_INDEXES)
+        conn.commit()
         club_id = ensure_club(conn, "Default Club")
         seed_default_profiles(conn, club_id)
         seed_default_position_profiles(conn, club_id)
+        seed_default_admin(conn, club_id)
         conn.commit()
     finally:
         conn.close()
@@ -263,6 +338,394 @@ def _migrate(conn):
         print("✓ Migrated: added session_type to physical_data")
     conn.commit()
 
+    # -----------------------------------------------------------------------
+    # Phase 1 — authentication & club isolation.
+    # Adds a ``club_id`` to every data table and rebuilds the tables whose
+    # UNIQUE constraints must become club-scoped (teams, players, physical_data)
+    # so two clubs can hold same-named entities without colliding. Existing rows
+    # are assigned to the default club. Fully idempotent.
+    # -----------------------------------------------------------------------
+    _migrate_club_isolation(conn)
+
+    # -----------------------------------------------------------------------
+    # Phase 2 — self-service onboarding, club limits & expanded roles.
+    # Adds subscription/limit columns to clubs and email/is_active/team_id to
+    # users. Promotes the legacy 'admin' user to 'platform_admin'. Idempotent.
+    # -----------------------------------------------------------------------
+    _migrate_phase2(conn)
+
+    # -----------------------------------------------------------------------
+    # Phase 3 — team-level data isolation within clubs.
+    # Adds team_id to players & physical_data, creates the
+    # user_team_assignments junction table, back-fills team_id for existing
+    # rows, migrates any legacy users.team_id into the junction table and then
+    # drops the users.team_id column. Idempotent.
+    # -----------------------------------------------------------------------
+    _migrate_phase3(conn)
+
+
+def _migrate_phase3(conn):
+    """Add team_id to data tables + user_team_assignments junction. Idempotent."""
+    conn.execute("PRAGMA foreign_keys = OFF")
+
+    # 1. Junction table (also created via SCHEMA for fresh DBs).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_team_assignments (
+               assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id       INTEGER NOT NULL,
+               team_id       INTEGER NOT NULL,
+               created_at    TEXT NOT NULL,
+               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+               FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
+               UNIQUE (user_id, team_id)
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_uta_user ON user_team_assignments(user_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_uta_team ON user_team_assignments(team_id)"
+    )
+
+    # 2. team_id columns on players & physical_data.
+    if not _has_column(conn, "players", "team_id"):
+        conn.execute(
+            "ALTER TABLE players ADD COLUMN team_id INTEGER REFERENCES teams(id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id)"
+        )
+        print("✓ Migrated: added team_id to players")
+    if not _has_column(conn, "physical_data", "team_id"):
+        conn.execute(
+            "ALTER TABLE physical_data ADD COLUMN team_id INTEGER REFERENCES teams(id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_physical_team ON physical_data(team_id)"
+        )
+        print("✓ Migrated: added team_id to physical_data")
+
+    # 3. Migrate any legacy users.team_id → junction, then drop the column.
+    if _has_column(conn, "users", "team_id"):
+        for r in conn.execute(
+            "SELECT id, team_id FROM users WHERE team_id IS NOT NULL"
+        ).fetchall():
+            conn.execute(
+                "INSERT OR IGNORE INTO user_team_assignments "
+                "(user_id, team_id, created_at) VALUES (?, ?, ?)",
+                (r["id"], r["team_id"], _now()),
+            )
+        try:
+            conn.execute("ALTER TABLE users DROP COLUMN team_id")
+            print("✓ Migrated: moved users.team_id → user_team_assignments")
+        except Exception as exc:  # pragma: no cover - older sqlite
+            print(f"⚠ Could not drop users.team_id ({exc}); leaving column unused")
+
+    conn.commit()
+
+    # 4. Back-fill team_id for existing rows (per club).
+    _backfill_team_ids(conn)
+
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.commit()
+
+
+def _ensure_unassigned_team(conn, club_id):
+    """Return the id of this club's 'Unassigned' team, creating it if needed."""
+    row = conn.execute(
+        "SELECT id FROM teams WHERE club_id = ? AND name = ? "
+        "AND IFNULL(age_group,'') = ''",
+        (club_id, "Unassigned"),
+    ).fetchone()
+    if row:
+        return row["id"]
+    cur = conn.execute(
+        "INSERT INTO teams (club_id, name, age_group, created_at) "
+        "VALUES (?, 'Unassigned', NULL, ?)",
+        (club_id, _now()),
+    )
+    return cur.lastrowid
+
+
+def _backfill_team_ids(conn):
+    """Assign a team_id to every players/physical_data row lacking one."""
+    # ---- players ----
+    players = conn.execute(
+        "SELECT id, club_id FROM players WHERE team_id IS NULL"
+    ).fetchall()
+    for p in players:
+        # Prefer the team of the matches this player actually appeared in.
+        row = conn.execute(
+            """SELECT m.team_id AS tid, COUNT(*) AS n
+                 FROM player_match_stats pms
+                 JOIN matches m ON m.id = pms.match_id
+                WHERE pms.player_id = ?
+                GROUP BY m.team_id
+                ORDER BY n DESC LIMIT 1""",
+            (p["id"],),
+        ).fetchone()
+        team_id = row["tid"] if row and row["tid"] else None
+        if team_id is None:
+            # No matches → first existing team of the club, else 'Unassigned'.
+            t = conn.execute(
+                "SELECT id FROM teams WHERE club_id = ? ORDER BY id LIMIT 1",
+                (p["club_id"],),
+            ).fetchone()
+            team_id = t["id"] if t else _ensure_unassigned_team(conn, p["club_id"])
+        conn.execute(
+            "UPDATE players SET team_id = ? WHERE id = ?", (team_id, p["id"])
+        )
+
+    # ---- physical_data ----
+    pds = conn.execute(
+        "SELECT id, club_id, match_id, player_id, player_name "
+        "FROM physical_data WHERE team_id IS NULL"
+    ).fetchall()
+    for pd_row in pds:
+        team_id = None
+        # 1) linked match's team
+        if pd_row["match_id"] is not None:
+            m = conn.execute(
+                "SELECT team_id FROM matches WHERE id = ?", (pd_row["match_id"],)
+            ).fetchone()
+            if m:
+                team_id = m["team_id"]
+        # 2) linked player's team
+        if team_id is None and pd_row["player_id"] is not None:
+            pl = conn.execute(
+                "SELECT team_id FROM players WHERE id = ?", (pd_row["player_id"],)
+            ).fetchone()
+            if pl and pl["team_id"]:
+                team_id = pl["team_id"]
+        # 3) player matched by name within the club
+        if team_id is None and pd_row["player_name"]:
+            pl = conn.execute(
+                "SELECT team_id FROM players WHERE club_id = ? AND name = ?",
+                (pd_row["club_id"], pd_row["player_name"]),
+            ).fetchone()
+            if pl and pl["team_id"]:
+                team_id = pl["team_id"]
+        # 4) fall back to first team / Unassigned
+        if team_id is None:
+            t = conn.execute(
+                "SELECT id FROM teams WHERE club_id = ? ORDER BY id LIMIT 1",
+                (pd_row["club_id"],),
+            ).fetchone()
+            team_id = t["id"] if t else _ensure_unassigned_team(conn, pd_row["club_id"])
+        conn.execute(
+            "UPDATE physical_data SET team_id = ? WHERE id = ?",
+            (team_id, pd_row["id"]),
+        )
+    conn.commit()
+
+
+def _migrate_phase2(conn):
+    """Add Phase 2 onboarding/limit columns and upgrade roles. Idempotent."""
+    club_cols = {r["name"] for r in conn.execute("PRAGMA table_info(clubs)").fetchall()}
+    if "subscription_status" not in club_cols:
+        conn.execute(
+            "ALTER TABLE clubs ADD COLUMN subscription_status TEXT NOT NULL "
+            "DEFAULT 'trial'"
+        )
+        print("✓ Migrated: added subscription_status to clubs")
+    if "max_users" not in club_cols:
+        conn.execute(
+            "ALTER TABLE clubs ADD COLUMN max_users INTEGER NOT NULL DEFAULT 3"
+        )
+        print("✓ Migrated: added max_users to clubs")
+    if "max_teams" not in club_cols:
+        conn.execute(
+            "ALTER TABLE clubs ADD COLUMN max_teams INTEGER NOT NULL DEFAULT 3"
+        )
+        print("✓ Migrated: added max_teams to clubs")
+    if "is_active" not in club_cols:
+        conn.execute(
+            "ALTER TABLE clubs ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
+        )
+        print("✓ Migrated: added is_active to clubs")
+
+    user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "email" not in user_cols:
+        # SQLite cannot ADD a UNIQUE column directly; add plain then index.
+        conn.execute("ALTER TABLE users ADD COLUMN email TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email "
+            "ON users(email) WHERE email IS NOT NULL"
+        )
+        print("✓ Migrated: added email to users")
+    if "is_active" not in user_cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
+        )
+        print("✓ Migrated: added is_active to users")
+    # Note: users.team_id (single-team link) is intentionally NOT added here.
+    # Phase 3 manages team membership via the user_team_assignments junction
+    # table and drops any legacy users.team_id column.
+
+    # Promote the legacy default admin to platform_admin.
+    conn.execute(
+        "UPDATE users SET role = 'platform_admin' "
+        "WHERE username = 'admin' AND role = 'admin'"
+    )
+    conn.commit()
+
+
+def _has_column(conn, table, column):
+    return column in {
+        r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+
+
+def _migrate_club_isolation(conn):
+    """Add club_id to data tables + rebuild club-scoped UNIQUE constraints."""
+    # Nothing to do if already migrated.
+    if _has_column(conn, "players", "club_id") and _has_column(conn, "teams", "club_id"):
+        return
+
+    # Ensure a default club exists and grab its id for back-filling.
+    default_club_id = ensure_club(conn, "Default Club")
+    conn.commit()
+
+    # Foreign keys must be off while we drop/rename parent tables.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+
+    # teams: add club_id + UNIQUE(club_id, name, age_group)
+    if not _has_column(conn, "teams", "club_id"):
+        conn.executescript(
+            """
+            CREATE TABLE teams__new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                club_id     INTEGER NOT NULL,
+                name        TEXT NOT NULL,
+                age_group   TEXT,
+                created_at  TEXT NOT NULL,
+                FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
+                UNIQUE (club_id, name, age_group)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO teams__new (id, club_id, name, age_group, created_at) "
+            "SELECT id, ?, name, age_group, created_at FROM teams",
+            (default_club_id,),
+        )
+        conn.execute("DROP TABLE teams")
+        conn.execute("ALTER TABLE teams__new RENAME TO teams")
+        print("✓ Migrated: added club_id to teams")
+
+    # players: add club_id + UNIQUE(club_id, name)
+    if not _has_column(conn, "players", "club_id"):
+        conn.executescript(
+            """
+            CREATE TABLE players__new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                club_id     INTEGER NOT NULL,
+                name        TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
+                UNIQUE (club_id, name)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO players__new (id, club_id, name, created_at) "
+            "SELECT id, ?, name, created_at FROM players",
+            (default_club_id,),
+        )
+        conn.execute("DROP TABLE players")
+        conn.execute("ALTER TABLE players__new RENAME TO players")
+        print("✓ Migrated: added club_id to players")
+
+    # matches: simple ADD COLUMN (UNIQUE(team_id, ...) is already club-scoped
+    # because each team belongs to one club).
+    if not _has_column(conn, "matches", "club_id"):
+        conn.execute("ALTER TABLE matches ADD COLUMN club_id INTEGER REFERENCES clubs(id)")
+        conn.execute(
+            "UPDATE matches SET club_id = ? WHERE club_id IS NULL", (default_club_id,)
+        )
+        print("✓ Migrated: added club_id to matches")
+
+    # player_match_stats: simple ADD COLUMN.
+    if not _has_column(conn, "player_match_stats", "club_id"):
+        conn.execute(
+            "ALTER TABLE player_match_stats ADD COLUMN club_id INTEGER REFERENCES clubs(id)"
+        )
+        conn.execute(
+            "UPDATE player_match_stats SET club_id = ? WHERE club_id IS NULL",
+            (default_club_id,),
+        )
+        print("✓ Migrated: added club_id to player_match_stats")
+
+    # physical_data: rebuild for UNIQUE(club_id, player_name, session_name,
+    # period, data_source). Copy all existing columns dynamically.
+    if not _has_column(conn, "physical_data", "club_id"):
+        old_cols = [
+            r["name"] for r in conn.execute(
+                "PRAGMA table_info(physical_data)"
+            ).fetchall()
+        ]
+        col_list = ", ".join(old_cols)
+        conn.executescript(
+            """
+            CREATE TABLE physical_data__new (
+                id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+                club_id                         INTEGER NOT NULL,
+                player_id                       INTEGER,
+                match_id                        INTEGER,
+                player_name                     TEXT,
+                period                          TEXT NOT NULL DEFAULT 'Full Match',
+                session_name                    TEXT,
+                match_date                      TEXT,
+                start_time                      TEXT,
+                end_time                        TEXT,
+                total_time_minutes              REAL,
+                total_distance                  REAL,
+                distance_per_minute             REAL,
+                sprint_distance                 REAL,
+                high_intensity_distance         REAL,
+                hml_distance                    REAL,
+                top_speed                       REAL,
+                top_speed_ms                    REAL,
+                percentage_max_speed            REAL,
+                sprint_count                    REAL,
+                high_intensity_events           REAL,
+                high_intensity_bursts_distance  REAL,
+                high_intensity_bursts_count     REAL,
+                accelerations                   REAL,
+                decelerations                   REAL,
+                acc_dec_total                   REAL,
+                max_acceleration                REAL,
+                session_load                    REAL,
+                edi_percentage                  REAL,
+                distance_zone5                  REAL,
+                distance_zone6                  REAL,
+                entries_zone6                   REAL,
+                data_source                     TEXT,
+                source_filename                 TEXT,
+                uploaded_at                     TEXT,
+                raw_data                        TEXT,
+                session_type                    TEXT NOT NULL DEFAULT 'unlinked',
+                FOREIGN KEY (club_id) REFERENCES clubs(id) ON DELETE CASCADE,
+                FOREIGN KEY (player_id) REFERENCES players(id),
+                FOREIGN KEY (match_id) REFERENCES matches(id) ON DELETE SET NULL,
+                UNIQUE (club_id, player_name, session_name, period, data_source)
+            );
+            """
+        )
+        conn.execute(
+            f"INSERT INTO physical_data__new (club_id, {col_list}) "
+            f"SELECT ?, {col_list} FROM physical_data",
+            (default_club_id,),
+        )
+        conn.execute("DROP TABLE physical_data")
+        conn.execute("ALTER TABLE physical_data__new RENAME TO physical_data")
+        print("✓ Migrated: added club_id to physical_data")
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # Seeding
@@ -275,6 +738,487 @@ def ensure_club(conn, name):
         "INSERT INTO clubs (name, created_at) VALUES (?, ?)", (name, _now())
     )
     return cur.lastrowid
+
+
+def get_club(conn, club_id):
+    """Return the club row for ``club_id`` (or None)."""
+    return conn.execute(
+        "SELECT * FROM clubs WHERE id = ?", (club_id,)
+    ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Authentication (Phase 1)
+# ---------------------------------------------------------------------------
+def hash_password(password):
+    """Return a bcrypt hash (str) for the given plaintext password."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password, password_hash):
+    """Return True if ``password`` matches the stored bcrypt ``password_hash``."""
+    if not password_hash:
+        return False
+    try:
+        return bcrypt.checkpw(
+            password.encode("utf-8"), password_hash.encode("utf-8")
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def get_user_by_username(conn, username):
+    """Return the user row for ``username`` (or None)."""
+    return conn.execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+
+
+def get_user_by_email(conn, email):
+    """Return the user row for ``email`` (or None)."""
+    if not email:
+        return None
+    return conn.execute(
+        "SELECT * FROM users WHERE email = ?", (email,)
+    ).fetchone()
+
+
+def create_user(conn, username, password, club_id, role="coach",
+                email=None, team_id=None, is_active=True):
+    """Create a new user with a bcrypt-hashed password. Returns the new id.
+
+    Phase 3: ``team_id`` (single team) is accepted for backwards compatibility;
+    when provided it is recorded as a row in ``user_team_assignments`` rather
+    than on the users table.
+    """
+    cur = conn.execute(
+        """INSERT INTO users
+               (username, password_hash, club_id, role, created_at,
+                email, is_active)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (username, hash_password(password), club_id, role, _now(),
+         (email or None), 1 if is_active else 0),
+    )
+    user_id = cur.lastrowid
+    conn.commit()
+    if team_id is not None:
+        assign_user_to_team(conn, user_id, team_id)
+    return user_id
+
+
+def authenticate(conn, username, password):
+    """Validate credentials. Return the user row on success, else None.
+
+    Note: ``is_active`` checks for the user and their club are handled by the
+    caller (see ``authenticate_full``) so a distinct error message can be
+    shown. This function only verifies the password.
+    """
+    user = get_user_by_username(conn, username)
+    if user and verify_password(password, user["password_hash"]):
+        return user
+    return None
+
+
+def authenticate_full(conn, username, password):
+    """Authenticate and enforce active-status for the user and their club.
+
+    Returns ``(user_row, error)``. On success ``error`` is None. On failure
+    ``user_row`` is None and ``error`` is one of:
+      'invalid'        — bad username/password
+      'user_inactive'  — account deactivated
+      'club_inactive'  — club deactivated/suspended
+    """
+    user = authenticate(conn, username, password)
+    if not user:
+        return None, "invalid"
+    # is_active may be absent on very old rows → treat missing as active.
+    if "is_active" in user.keys() and not user["is_active"]:
+        return None, "user_inactive"
+    club = get_club(conn, user["club_id"])
+    if club is not None and "is_active" in club.keys() and not club["is_active"]:
+        return None, "club_inactive"
+    return user, None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — onboarding, club limits, club/user/team management
+# ---------------------------------------------------------------------------
+VALID_ROLES = ("platform_admin", "club_admin", "analyst", "coach")
+# Roles a club_admin is allowed to assign to members of their own club.
+CLUB_ASSIGNABLE_ROLES = ("analyst", "coach")
+
+
+def get_club_user_count(conn, club_id):
+    """Number of users belonging to a club (active + inactive)."""
+    return conn.execute(
+        "SELECT COUNT(*) c FROM users WHERE club_id = ?", (club_id,)
+    ).fetchone()["c"]
+
+
+def get_club_team_count(conn, club_id):
+    """Number of teams belonging to a club."""
+    return conn.execute(
+        "SELECT COUNT(*) c FROM teams WHERE club_id = ?", (club_id,)
+    ).fetchone()["c"]
+
+
+def _club_limits(conn, club_id):
+    club = get_club(conn, club_id)
+    if club is None:
+        return 0, 0
+    keys = club.keys()
+    max_users = club["max_users"] if "max_users" in keys else 3
+    max_teams = club["max_teams"] if "max_teams" in keys else 3
+    return max_users, max_teams
+
+
+def can_add_user(conn, club_id):
+    """True if the club has not yet reached its max_users limit."""
+    max_users, _ = _club_limits(conn, club_id)
+    return get_club_user_count(conn, club_id) < max_users
+
+
+def can_add_team(conn, club_id):
+    """True if the club has not yet reached its max_teams limit."""
+    _, max_teams = _club_limits(conn, club_id)
+    return get_club_team_count(conn, club_id) < max_teams
+
+
+def club_name_exists(conn, name):
+    """Case-insensitive check whether a club name is already taken."""
+    return conn.execute(
+        "SELECT 1 FROM clubs WHERE LOWER(name) = LOWER(?)", (name,)
+    ).fetchone() is not None
+
+
+def list_clubs(conn):
+    """All clubs with their user/team counts (for the platform admin panel)."""
+    rows = conn.execute("SELECT * FROM clubs ORDER BY id").fetchall()
+    out = []
+    for c in rows:
+        d = dict(c)
+        d["user_count"] = get_club_user_count(conn, c["id"])
+        d["team_count"] = get_club_team_count(conn, c["id"])
+        out.append(d)
+    return out
+
+
+def list_users_for_club(conn, club_id):
+    """All users of a club with a comma-joined list of their assigned teams.
+
+    ``team_name`` aggregates every team the user is assigned to (Phase 3 is
+    many-to-many). Users with no assignment get NULL.
+    """
+    return conn.execute(
+        """SELECT u.*,
+                  (SELECT GROUP_CONCAT(t.name, ', ')
+                     FROM user_team_assignments uta
+                     JOIN teams t ON t.id = uta.team_id
+                    WHERE uta.user_id = u.id) AS team_name
+           FROM users u
+           WHERE u.club_id = ? ORDER BY u.id""",
+        (club_id,),
+    ).fetchall()
+
+
+def list_teams(conn, club_id):
+    """All teams of a club (for management + dropdowns)."""
+    return conn.execute(
+        "SELECT * FROM teams WHERE club_id = ? ORDER BY name, age_group",
+        (club_id,),
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — team-level access control (user ↔ team assignments)
+# ---------------------------------------------------------------------------
+def _team_filter_sql(team_ids, column="team_id"):
+    """Build a SQL fragment + params for filtering ``column`` by team_ids.
+
+    Returns ``(" AND <clause>", params)``.
+      * ``team_ids is None`` → no filtering (admin scopes): empty fragment.
+      * empty list           → ``" AND 1=0"`` (matches nothing).
+      * non-empty list       → ``" AND column IN (?,?,...)"``.
+    """
+    if team_ids is None:
+        return "", []
+    ids = list(team_ids)
+    if not ids:
+        return " AND 1=0", []
+    placeholders = ",".join("?" * len(ids))
+    return f" AND {column} IN ({placeholders})", ids
+
+
+def list_user_team_ids(conn, user_id):
+    """Raw list of team_ids assigned to a user via the junction table."""
+    return [
+        r["team_id"] for r in conn.execute(
+            "SELECT team_id FROM user_team_assignments WHERE user_id = ? "
+            "ORDER BY team_id",
+            (user_id,),
+        ).fetchall()
+    ]
+
+
+def get_user_team_ids(conn, user_id):
+    """Return the list of team_ids a user may access, based on their role.
+
+    * platform_admin → every team in the database.
+    * club_admin     → every team in the user's club.
+    * analyst/coach  → only the teams assigned in user_team_assignments.
+    """
+    user = conn.execute(
+        "SELECT id, club_id, role FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if user is None:
+        return []
+    role = user["role"]
+    if role == "platform_admin":
+        return [r["id"] for r in conn.execute("SELECT id FROM teams").fetchall()]
+    if role == "club_admin":
+        return [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM teams WHERE club_id = ?", (user["club_id"],)
+            ).fetchall()
+        ]
+    return list_user_team_ids(conn, user_id)
+
+
+def get_teams_for_user(conn, user_id):
+    """Return the team rows (as dicts) a user may access."""
+    ids = get_user_team_ids(conn, user_id)
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT * FROM teams WHERE id IN ({placeholders}) ORDER BY name, age_group",
+        ids,
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def assign_user_to_team(conn, user_id, team_id):
+    """Create a user↔team assignment. Returns True on success.
+
+    Validates that the user and the team belong to the same club; returns
+    False (no-op) when they do not, or when either does not exist.
+    """
+    user = conn.execute(
+        "SELECT club_id FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    team = conn.execute(
+        "SELECT club_id FROM teams WHERE id = ?", (team_id,)
+    ).fetchone()
+    if not user or not team or user["club_id"] != team["club_id"]:
+        return False
+    conn.execute(
+        "INSERT OR IGNORE INTO user_team_assignments (user_id, team_id, created_at) "
+        "VALUES (?, ?, ?)",
+        (user_id, team_id, _now()),
+    )
+    conn.commit()
+    return True
+
+
+def remove_user_team_assignment(conn, user_id, team_id):
+    """Delete a user↔team assignment. Returns True if a row was removed."""
+    cur = conn.execute(
+        "DELETE FROM user_team_assignments WHERE user_id = ? AND team_id = ?",
+        (user_id, team_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def set_user_team_assignments(conn, user_id, team_ids):
+    """Replace a user's team assignments with exactly ``team_ids``.
+
+    Only teams in the same club as the user are accepted. Returns the list of
+    team_ids that were actually assigned.
+    """
+    user = conn.execute(
+        "SELECT club_id FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if user is None:
+        return []
+    valid = {
+        r["id"] for r in conn.execute(
+            "SELECT id FROM teams WHERE club_id = ?", (user["club_id"],)
+        ).fetchall()
+    }
+    wanted = [t for t in (team_ids or []) if t in valid]
+    conn.execute(
+        "DELETE FROM user_team_assignments WHERE user_id = ?", (user_id,)
+    )
+    for t in wanted:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_team_assignments "
+            "(user_id, team_id, created_at) VALUES (?, ?, ?)",
+            (user_id, t, _now()),
+        )
+    conn.commit()
+    return wanted
+
+
+def create_team(conn, club_id, name, age_group=None):
+    """Create a team for a club, enforcing the max_teams limit.
+
+    Raises ValueError('limit_reached') if at the limit, or
+    ValueError('duplicate') if a same-name/age_group team already exists.
+    Returns the new team id.
+    """
+    name = (name or "").strip()
+    age_group = (age_group or "").strip() or None
+    if not name:
+        raise ValueError("empty_name")
+    if not can_add_team(conn, club_id):
+        raise ValueError("limit_reached")
+    existing = conn.execute(
+        "SELECT id FROM teams WHERE club_id = ? AND name = ? "
+        "AND IFNULL(age_group,'') = IFNULL(?, '')",
+        (club_id, name, age_group),
+    ).fetchone()
+    if existing:
+        raise ValueError("duplicate")
+    cur = conn.execute(
+        "INSERT INTO teams (club_id, name, age_group, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (club_id, name, age_group, _now()),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def create_club_user(conn, club_id, username, password, role="coach",
+                     email=None, team_id=None):
+    """Create a user for a club, enforcing limits + uniqueness.
+
+    Raises ValueError with one of: 'limit_reached', 'empty', 'bad_role',
+    'username_taken', 'email_taken'. Returns the new user id.
+    """
+    username = (username or "").strip()
+    email = (email or "").strip() or None
+    if not username or not password:
+        raise ValueError("empty")
+    if role not in VALID_ROLES:
+        raise ValueError("bad_role")
+    if not can_add_user(conn, club_id):
+        raise ValueError("limit_reached")
+    if get_user_by_username(conn, username):
+        raise ValueError("username_taken")
+    if email and get_user_by_email(conn, email):
+        raise ValueError("email_taken")
+    return create_user(conn, username, password, club_id, role=role,
+                       email=email, team_id=team_id, is_active=True)
+
+
+def set_user_active(conn, user_id, is_active, club_id=None):
+    """Activate/deactivate a user. Scoped to club_id when provided."""
+    if club_id is not None:
+        conn.execute(
+            "UPDATE users SET is_active = ? WHERE id = ? AND club_id = ?",
+            (1 if is_active else 0, user_id, club_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE users SET is_active = ? WHERE id = ?",
+            (1 if is_active else 0, user_id),
+        )
+    conn.commit()
+
+
+def update_club_limits(conn, club_id, max_users, max_teams):
+    """Platform-admin: update a club's user/team limits."""
+    conn.execute(
+        "UPDATE clubs SET max_users = ?, max_teams = ? WHERE id = ?",
+        (int(max_users), int(max_teams), club_id),
+    )
+    conn.commit()
+
+
+def set_club_active(conn, club_id, is_active):
+    """Platform-admin: activate/deactivate (suspend) a club."""
+    conn.execute(
+        "UPDATE clubs SET is_active = ? WHERE id = ?",
+        (1 if is_active else 0, club_id),
+    )
+    conn.commit()
+
+
+def update_club_subscription(conn, club_id, status):
+    """Platform-admin: set a club's subscription_status label."""
+    conn.execute(
+        "UPDATE clubs SET subscription_status = ? WHERE id = ?",
+        (status, club_id),
+    )
+    conn.commit()
+
+
+def register_club(conn, club_name, username, email, password):
+    """Self-service onboarding: create a club + its first club_admin user.
+
+    The new club is a 'trial' with default limits (3 users / 3 teams) and is
+    active. The first user becomes 'club_admin'. Default style/position
+    profiles are seeded so every screen works immediately.
+
+    Raises ValueError: 'club_taken', 'username_taken', 'email_taken',
+    'empty'. Returns (user_id, club_id).
+    """
+    club_name = (club_name or "").strip()
+    username = (username or "").strip()
+    email = (email or "").strip() or None
+    if not club_name or not username or not password:
+        raise ValueError("empty")
+    if club_name_exists(conn, club_name):
+        raise ValueError("club_taken")
+    if get_user_by_username(conn, username):
+        raise ValueError("username_taken")
+    if email and get_user_by_email(conn, email):
+        raise ValueError("email_taken")
+
+    cur = conn.execute(
+        """INSERT INTO clubs
+               (name, created_at, subscription_status, max_users, max_teams,
+                is_active)
+           VALUES (?, ?, 'trial', 3, 3, 1)""",
+        (club_name, _now()),
+    )
+    club_id = cur.lastrowid
+    # Seed starter profiles for the new club.
+    seed_default_profiles(conn, club_id)
+    seed_default_position_profiles(conn, club_id)
+    user_id = create_user(conn, username, password, club_id,
+                          role="club_admin", email=email, is_active=True)
+    conn.commit()
+    return user_id, club_id
+
+
+def seed_default_admin(conn, club_id):
+    """Create the default admin/admin123 platform-admin account if missing."""
+    existing = conn.execute(
+        "SELECT id FROM users WHERE username = ?", ("admin",)
+    ).fetchone()
+    if existing:
+        return existing["id"]
+    cur = conn.execute(
+        """INSERT INTO users
+               (username, password_hash, club_id, role, created_at, is_active)
+           VALUES (?, ?, ?, ?, ?, 1)""",
+        ("admin", hash_password("admin123"), club_id, "platform_admin", _now()),
+    )
+    print("✓ Seeded default admin user (admin / admin123, platform_admin)")
+    return cur.lastrowid
+
+
+def ensure_club_seeded(conn, club_id):
+    """Ensure a club has its default style + position profiles seeded.
+
+    Called on login so that newly-created clubs get the same starter profiles
+    that the default club received during init.
+    """
+    seed_default_profiles(conn, club_id)
+    seed_default_position_profiles(conn, club_id)
+    conn.commit()
 
 
 def seed_default_profiles(conn, club_id):
@@ -426,59 +1370,74 @@ def reset_position_profile_to_default(conn, position_profile_id):
 # ---------------------------------------------------------------------------
 # Lookups / upserts used by the parser
 # ---------------------------------------------------------------------------
-def get_or_create_team(conn, name, age_group=None):
+def get_or_create_team(conn, club_id, name, age_group=None):
     row = conn.execute(
-        "SELECT id FROM teams WHERE name = ? AND IFNULL(age_group,'') = IFNULL(?, '')",
-        (name, age_group),
+        "SELECT id FROM teams WHERE club_id = ? AND name = ? "
+        "AND IFNULL(age_group,'') = IFNULL(?, '')",
+        (club_id, name, age_group),
     ).fetchone()
     if row:
         return row["id"]
     cur = conn.execute(
-        "INSERT INTO teams (name, age_group, created_at) VALUES (?, ?, ?)",
-        (name, age_group, _now()),
+        "INSERT INTO teams (club_id, name, age_group, created_at) VALUES (?, ?, ?, ?)",
+        (club_id, name, age_group, _now()),
     )
     return cur.lastrowid
 
 
-def get_or_create_player(conn, name):
-    row = conn.execute("SELECT id FROM players WHERE name = ?", (name,)).fetchone()
+def get_or_create_player(conn, club_id, name, team_id=None):
+    """Return the player id, creating the player if needed.
+
+    Phase 3: the player is tagged with ``team_id`` (team ownership). When the
+    player already exists but has no team yet, the team is back-filled.
+    """
+    row = conn.execute(
+        "SELECT id, team_id FROM players WHERE club_id = ? AND name = ?",
+        (club_id, name),
+    ).fetchone()
     if row:
+        if team_id is not None and row["team_id"] is None:
+            conn.execute(
+                "UPDATE players SET team_id = ? WHERE id = ?", (team_id, row["id"])
+            )
         return row["id"]
     cur = conn.execute(
-        "INSERT INTO players (name, created_at) VALUES (?, ?)", (name, _now())
+        "INSERT INTO players (club_id, team_id, name, created_at) VALUES (?, ?, ?, ?)",
+        (club_id, team_id, name, _now()),
     )
     return cur.lastrowid
 
 
-def find_match(conn, team_id, opponent, match_date):
+def find_match(conn, club_id, team_id, opponent, match_date):
     return conn.execute(
-        "SELECT id FROM matches WHERE team_id=? AND opponent=? AND match_date=?",
-        (team_id, opponent, match_date),
+        "SELECT id FROM matches WHERE club_id=? AND team_id=? AND opponent=? "
+        "AND match_date=?",
+        (club_id, team_id, opponent, match_date),
     ).fetchone()
 
 
-def create_match(conn, team_id, opponent, match_date, home_score, away_score,
-                 is_home, season, source_file, upload_hash=None,
+def create_match(conn, club_id, team_id, opponent, match_date, home_score,
+                 away_score, is_home, season, source_file, upload_hash=None,
                  session_type="match"):
     cur = conn.execute(
         """INSERT INTO matches
-           (team_id, opponent, match_date, home_score, away_score, is_home,
+           (club_id, team_id, opponent, match_date, home_score, away_score, is_home,
             season, source_file, upload_hash, session_type, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (team_id, opponent, match_date, home_score, away_score,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (club_id, team_id, opponent, match_date, home_score, away_score,
          1 if is_home else 0, season, source_file, upload_hash,
          session_type or "match", _now()),
     )
     return cur.lastrowid
 
 
-def find_match_by_hash(conn, upload_hash):
-    """Return the first match row sharing this upload hash, or None."""
+def find_match_by_hash(conn, club_id, upload_hash):
+    """Return the first match row sharing this upload hash within a club, or None."""
     if not upload_hash:
         return None
     return conn.execute(
-        "SELECT * FROM matches WHERE upload_hash = ? ORDER BY id LIMIT 1",
-        (upload_hash,),
+        "SELECT * FROM matches WHERE club_id = ? AND upload_hash = ? ORDER BY id LIMIT 1",
+        (club_id, upload_hash),
     ).fetchone()
 
 
@@ -526,15 +1485,26 @@ def _match_delete_counts(conn, match_id):
     return n_pms, n_sv
 
 
-def delete_match(conn, match_id, cleanup_players=True):
+def delete_match(conn, match_id, cleanup_players=True, club_id=None):
     """Cascade-delete a single match within a transaction.
 
     Removes the match, its player_match_stats and stat_values (via FK cascade),
     then optionally cleans up players left with zero matches.
 
+    When ``club_id`` is provided the match is only deleted if it belongs to
+    that club (returns zero counts otherwise), preventing cross-club deletes.
+
     Returns a dict of deletion counts. Rolls back on any error.
     """
     try:
+        if club_id is not None:
+            owns = conn.execute(
+                "SELECT 1 FROM matches WHERE id = ? AND club_id = ?",
+                (match_id, club_id),
+            ).fetchone()
+            if not owns:
+                return {"matches": 0, "player_stats": 0,
+                        "stat_values": 0, "players": 0}
         n_pms, n_sv = _match_delete_counts(conn, match_id)
         # ON DELETE CASCADE handles player_match_stats + stat_values, but we
         # delete explicitly so behaviour is identical regardless of PRAGMA state.
@@ -571,16 +1541,24 @@ def delete_match(conn, match_id, cleanup_players=True):
         raise
 
 
-def delete_matches_by_source(conn, source_file):
+def delete_matches_by_source(conn, source_file, club_id=None):
     """Delete every match that came from a given source PDF (cascade).
 
-    Returns aggregated deletion counts. Transaction-safe.
+    Scoped to ``club_id`` when provided so only the owning club's matches are
+    removed. Returns aggregated deletion counts. Transaction-safe.
     """
     try:
-        rows = conn.execute(
-            "SELECT id FROM matches WHERE IFNULL(source_file,'') = IFNULL(?, '')",
-            (source_file,),
-        ).fetchall()
+        if club_id is not None:
+            rows = conn.execute(
+                "SELECT id FROM matches WHERE club_id = ? "
+                "AND IFNULL(source_file,'') = IFNULL(?, '')",
+                (club_id, source_file),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id FROM matches WHERE IFNULL(source_file,'') = IFNULL(?, '')",
+                (source_file,),
+            ).fetchall()
         match_ids = [r["id"] for r in rows]
         totals = {"matches": 0, "player_stats": 0, "stat_values": 0, "players": 0}
         for mid in match_ids:
@@ -617,16 +1595,17 @@ def delete_matches_by_source(conn, source_file):
         raise
 
 
-def upsert_player_match_stats(conn, match_id, player_id, position, minutes_played,
-                              status="Starter", came_on_as=None):
+def upsert_player_match_stats(conn, club_id, match_id, player_id, position,
+                              minutes_played, status="Starter", came_on_as=None):
     cur = conn.execute(
         """INSERT INTO player_match_stats
-             (match_id, player_id, position, status, came_on_as, minutes_played, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+             (club_id, match_id, player_id, position, status, came_on_as,
+              minutes_played, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(match_id, player_id) DO UPDATE SET
              position=excluded.position, status=excluded.status,
              came_on_as=excluded.came_on_as, minutes_played=excluded.minutes_played""",
-        (match_id, player_id, position, status or "Starter", came_on_as,
+        (club_id, match_id, player_id, position, status or "Starter", came_on_as,
          minutes_played, _now()),
     )
     if cur.lastrowid:
@@ -638,7 +1617,8 @@ def upsert_player_match_stats(conn, match_id, player_id, position, minutes_playe
     return cur.lastrowid
 
 
-def update_player_match_position(conn, player_match_stat_id, new_position):
+def update_player_match_position(conn, player_match_stat_id, new_position,
+                                 club_id=None):
     """Update the ``position`` of a single player_match_stats row.
 
     Used by the Match Dashboard position-editing flow. Impact scores are
@@ -648,10 +1628,16 @@ def update_player_match_position(conn, player_match_stat_id, new_position):
 
     Returns True if a row was updated, False otherwise.
     """
-    cur = conn.execute(
-        "UPDATE player_match_stats SET position = ? WHERE id = ?",
-        (new_position, player_match_stat_id),
-    )
+    if club_id is not None:
+        cur = conn.execute(
+            "UPDATE player_match_stats SET position = ? WHERE id = ? AND club_id = ?",
+            (new_position, player_match_stat_id, club_id),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE player_match_stats SET position = ? WHERE id = ?",
+            (new_position, player_match_stat_id),
+        )
     conn.commit()
     return cur.rowcount > 0
 
@@ -736,35 +1722,44 @@ def reset_profile_to_default(conn, profile_id, profile_name):
     return True
 
 
-def list_matches(conn):
+def list_matches(conn, club_id, team_ids=None):
+    frag, fp = _team_filter_sql(team_ids, "m.team_id")
     return conn.execute(
-        """SELECT m.*, t.name AS team_name, t.age_group
+        f"""SELECT m.*, t.name AS team_name, t.age_group
            FROM matches m JOIN teams t ON t.id = m.team_id
-           ORDER BY m.match_date DESC"""
+           WHERE m.club_id = ?{frag}
+           ORDER BY m.match_date DESC""",
+        (club_id, *fp),
     ).fetchall()
 
 
-def list_matches_detailed(conn):
+def list_matches_detailed(conn, club_id, team_ids=None):
     """Matches enriched with player count and source PDF for management views."""
+    frag, fp = _team_filter_sql(team_ids, "m.team_id")
     return conn.execute(
-        """SELECT m.*, t.name AS team_name, t.age_group,
+        f"""SELECT m.*, t.name AS team_name, t.age_group,
                   (SELECT COUNT(*) FROM player_match_stats pms
                    WHERE pms.match_id = m.id) AS player_count
            FROM matches m JOIN teams t ON t.id = m.team_id
-           ORDER BY m.match_date DESC"""
+           WHERE m.club_id = ?{frag}
+           ORDER BY m.match_date DESC""",
+        (club_id, *fp),
     ).fetchall()
 
 
-def list_upload_history(conn):
+def list_upload_history(conn, club_id, team_ids=None):
     """Group matches by their source PDF for the upload-history table.
 
     Returns a list of dicts: source_file, n_matches, first_uploaded,
     last_uploaded, match_ids.
     """
+    frag, fp = _team_filter_sql(team_ids, "m.team_id")
     rows = conn.execute(
-        """SELECT m.id, m.source_file, m.created_at, m.match_date, m.opponent
+        f"""SELECT m.id, m.source_file, m.created_at, m.match_date, m.opponent
            FROM matches m
-           ORDER BY m.created_at DESC, m.id DESC"""
+           WHERE m.club_id = ?{frag}
+           ORDER BY m.created_at DESC, m.id DESC""",
+        (club_id, *fp),
     ).fetchall()
     groups = {}
     order = []
@@ -793,23 +1788,40 @@ def list_upload_history(conn):
     return [groups[k] for k in order]
 
 
-def get_match(conn, match_id):
+def get_match(conn, match_id, club_id=None, team_ids=None):
+    frag, fp = _team_filter_sql(team_ids, "m.team_id")
+    if club_id is not None:
+        return conn.execute(
+            f"""SELECT m.*, t.name AS team_name, t.age_group
+               FROM matches m JOIN teams t ON t.id = m.team_id
+               WHERE m.id=? AND m.club_id=?{frag}""",
+            (match_id, club_id, *fp),
+        ).fetchone()
     return conn.execute(
-        """SELECT m.*, t.name AS team_name, t.age_group
-           FROM matches m JOIN teams t ON t.id = m.team_id WHERE m.id=?""",
-        (match_id,),
+        f"""SELECT m.*, t.name AS team_name, t.age_group
+           FROM matches m JOIN teams t ON t.id = m.team_id WHERE m.id=?{frag}""",
+        (match_id, *fp),
     ).fetchone()
 
 
-def get_match_player_stats(conn, match_id):
+def get_match_player_stats(conn, match_id, club_id=None):
     """Return list of dicts: player stats rows for a match with stat values folded in."""
-    pms_rows = conn.execute(
-        """SELECT pms.id AS pms_id, pms.position, pms.status, pms.came_on_as,
-                  pms.minutes_played, p.id AS player_id, p.name AS player_name
-           FROM player_match_stats pms JOIN players p ON p.id = pms.player_id
-           WHERE pms.match_id=?""",
-        (match_id,),
-    ).fetchall()
+    if club_id is not None:
+        pms_rows = conn.execute(
+            """SELECT pms.id AS pms_id, pms.position, pms.status, pms.came_on_as,
+                      pms.minutes_played, p.id AS player_id, p.name AS player_name
+               FROM player_match_stats pms JOIN players p ON p.id = pms.player_id
+               WHERE pms.match_id=? AND pms.club_id=?""",
+            (match_id, club_id),
+        ).fetchall()
+    else:
+        pms_rows = conn.execute(
+            """SELECT pms.id AS pms_id, pms.position, pms.status, pms.came_on_as,
+                      pms.minutes_played, p.id AS player_id, p.name AS player_name
+               FROM player_match_stats pms JOIN players p ON p.id = pms.player_id
+               WHERE pms.match_id=?""",
+            (match_id,),
+        ).fetchall()
     result = []
     for r in pms_rows:
         stats = {
@@ -828,29 +1840,48 @@ def get_match_player_stats(conn, match_id):
     return result
 
 
-def list_players(conn):
+def list_players(conn, club_id, team_ids=None):
+    frag, fp = _team_filter_sql(team_ids, "p.team_id")
     return conn.execute(
-        """SELECT p.id, p.name, COUNT(pms.id) AS appearances
+        f"""SELECT p.id, p.name, p.team_id, COUNT(pms.id) AS appearances
            FROM players p LEFT JOIN player_match_stats pms ON pms.player_id = p.id
-           GROUP BY p.id ORDER BY p.name"""
+           WHERE p.club_id = ?{frag}
+           GROUP BY p.id ORDER BY p.name""",
+        (club_id, *fp),
     ).fetchall()
 
 
-def get_player_match_history(conn, player_id):
+def get_player_match_history(conn, player_id, club_id=None, team_ids=None):
     """Return chronological list of {match info + stats} for a player."""
-    rows = conn.execute(
-        """SELECT pms.id AS pms_id, pms.position, pms.status, pms.came_on_as,
-                  pms.minutes_played,
-                  m.id AS match_id, m.opponent, m.match_date, m.home_score,
-                  m.away_score, m.is_home, m.season, m.session_type,
-                  t.name AS team_name
-           FROM player_match_stats pms
-           JOIN matches m ON m.id = pms.match_id
-           JOIN teams t ON t.id = m.team_id
-           WHERE pms.player_id=?
-           ORDER BY m.match_date ASC""",
-        (player_id,),
-    ).fetchall()
+    frag, fp = _team_filter_sql(team_ids, "m.team_id")
+    if club_id is not None:
+        rows = conn.execute(
+            f"""SELECT pms.id AS pms_id, pms.position, pms.status, pms.came_on_as,
+                      pms.minutes_played,
+                      m.id AS match_id, m.opponent, m.match_date, m.home_score,
+                      m.away_score, m.is_home, m.season, m.session_type,
+                      t.name AS team_name
+               FROM player_match_stats pms
+               JOIN matches m ON m.id = pms.match_id
+               JOIN teams t ON t.id = m.team_id
+               WHERE pms.player_id=? AND pms.club_id=?{frag}
+               ORDER BY m.match_date ASC""",
+            (player_id, club_id, *fp),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""SELECT pms.id AS pms_id, pms.position, pms.status, pms.came_on_as,
+                      pms.minutes_played,
+                      m.id AS match_id, m.opponent, m.match_date, m.home_score,
+                      m.away_score, m.is_home, m.season, m.session_type,
+                      t.name AS team_name
+               FROM player_match_stats pms
+               JOIN matches m ON m.id = pms.match_id
+               JOIN teams t ON t.id = m.team_id
+               WHERE pms.player_id=?{frag}
+               ORDER BY m.match_date ASC""",
+            (player_id, *fp),
+        ).fetchall()
     out = []
     for r in rows:
         stats = {
@@ -874,15 +1905,32 @@ def get_player_match_history(conn, player_id):
     return out
 
 
-def get_player(conn, player_id):
-    return conn.execute("SELECT * FROM players WHERE id=?", (player_id,)).fetchone()
+def get_player(conn, player_id, club_id=None, team_ids=None):
+    frag, fp = _team_filter_sql(team_ids, "team_id")
+    if club_id is not None:
+        return conn.execute(
+            f"SELECT * FROM players WHERE id=? AND club_id=?{frag}",
+            (player_id, club_id, *fp),
+        ).fetchone()
+    return conn.execute(
+        f"SELECT * FROM players WHERE id=?{frag}", (player_id, *fp)
+    ).fetchone()
 
 
-def summary_counts(conn):
-    matches = conn.execute("SELECT COUNT(*) c FROM matches").fetchone()["c"]
-    players = conn.execute("SELECT COUNT(*) c FROM players").fetchone()["c"]
+def summary_counts(conn, club_id, team_ids=None):
+    mfrag, mfp = _team_filter_sql(team_ids, "team_id")
+    matches = conn.execute(
+        f"SELECT COUNT(*) c FROM matches WHERE club_id=?{mfrag}",
+        (club_id, *mfp),
+    ).fetchone()["c"]
+    players = conn.execute(
+        f"SELECT COUNT(*) c FROM players WHERE club_id=?{mfrag}",
+        (club_id, *mfp),
+    ).fetchone()["c"]
     dr = conn.execute(
-        "SELECT MIN(match_date) mn, MAX(match_date) mx FROM matches"
+        f"SELECT MIN(match_date) mn, MAX(match_date) mx FROM matches "
+        f"WHERE club_id=?{mfrag}",
+        (club_id, *mfp),
     ).fetchone()
     return {"matches": matches, "players": players,
             "date_min": dr["mn"], "date_max": dr["mx"]}
@@ -923,8 +1971,8 @@ def _clean_num(v):
         return None
 
 
-def save_physical_data(conn, df, match_id=None, source_filename=None,
-                       session_type="unlinked", session_name=None):
+def save_physical_data(conn, club_id, df, match_id=None, source_filename=None,
+                       session_type="unlinked", session_name=None, team_id=None):
     """Insert parsed physical rows (a DataFrame from physical_parser) into the DB.
 
     Player names are linked to existing players when an exact match exists,
@@ -949,6 +1997,17 @@ def save_physical_data(conn, df, match_id=None, source_filename=None,
     if session_type != "match":
         match_id = None
 
+    # Resolve the team this session belongs to (Phase 3 ownership).
+    # Priority: explicit team_id arg → linked match's team.
+    match_team_id = None
+    if match_id is not None:
+        m = conn.execute(
+            "SELECT team_id FROM matches WHERE id = ? AND club_id = ?",
+            (match_id, club_id),
+        ).fetchone()
+        if m:
+            match_team_id = m["team_id"]
+
     inserted = linked = unlinked = 0
     all_cols = (_PHYSICAL_CONTEXT_COLS + _PHYSICAL_METRIC_COLS
                 + ["data_source"])
@@ -957,12 +2016,21 @@ def save_physical_data(conn, df, match_id=None, source_filename=None,
         if not name:
             continue
         # Link to existing player if present (do not auto-create here).
-        pr = conn.execute("SELECT id FROM players WHERE name = ?", (name,)).fetchone()
+        pr = conn.execute(
+            "SELECT id, team_id FROM players WHERE club_id = ? AND name = ?",
+            (club_id, name),
+        ).fetchone()
         player_id = pr["id"] if pr else None
         if player_id:
             linked += 1
         else:
             unlinked += 1
+
+        # Effective team_id: linked match's team → caller's team_id →
+        # linked player's team. Keeps every row attributable to a team.
+        row_team_id = match_team_id or team_id
+        if row_team_id is None and pr is not None and pr["team_id"]:
+            row_team_id = pr["team_id"]
 
         values = {col: row.get(col) for col in all_cols}
         # numeric coercion for metric columns
@@ -974,11 +2042,12 @@ def save_physical_data(conn, df, match_id=None, source_filename=None,
 
         conn.execute(
             f"""INSERT INTO physical_data
-                (player_id, match_id, source_filename, uploaded_at, raw_data,
-                 session_type, {", ".join(all_cols)})
-                VALUES (?, ?, ?, ?, ?, ?, {", ".join(["?"] * len(all_cols))})
-                ON CONFLICT(player_name, session_name, period, data_source)
+                (club_id, team_id, player_id, match_id, source_filename,
+                 uploaded_at, raw_data, session_type, {", ".join(all_cols)})
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, {", ".join(["?"] * len(all_cols))})
+                ON CONFLICT(club_id, player_name, session_name, period, data_source)
                 DO UPDATE SET
+                  team_id=COALESCE(excluded.team_id, physical_data.team_id),
                   player_id=excluded.player_id,
                   match_id=excluded.match_id,
                   source_filename=excluded.source_filename,
@@ -988,22 +2057,29 @@ def save_physical_data(conn, df, match_id=None, source_filename=None,
                   {", ".join(f"{c}=excluded.{c}" for c in
                              (_PHYSICAL_CONTEXT_COLS[1:] + _PHYSICAL_METRIC_COLS))}
             """,
-            (player_id, match_id, source_filename, _now(), row.get("raw_data"),
-             session_type, *[values[col] for col in all_cols]),
+            (club_id, row_team_id, player_id, match_id, source_filename, _now(),
+             row.get("raw_data"), session_type, *[values[col] for col in all_cols]),
         )
         inserted += 1
     conn.commit()
     return {"inserted": inserted, "linked": linked, "unlinked": unlinked}
 
 
-def get_physical_data(conn, player_name=None, session_name=None, period=None,
-                      data_source=None, session_type=None, match_id=None):
+def get_physical_data(conn, club_id, player_name=None, session_name=None,
+                      period=None, data_source=None, session_type=None,
+                      match_id=None, team_ids=None):
     """Return physical_data rows as a list of sqlite Row, filtered as given.
 
-    Extra filters ``session_type`` ('match'/'training'/'unlinked') and
-    ``match_id`` allow the dashboard to scope data per session category.
+    Always scoped to ``club_id``. Extra filters ``session_type``
+    ('match'/'training'/'unlinked') and ``match_id`` allow the dashboard to
+    scope data per session category. ``team_ids`` restricts rows to the given
+    teams (Phase 3 team isolation; None = no team restriction).
     """
-    clauses, params = [], []
+    clauses, params = ["club_id = ?"], [club_id]
+    tfrag, tfp = _team_filter_sql(team_ids, "team_id")
+    if tfrag:
+        clauses.append(tfrag.replace(" AND ", "", 1))
+        params.extend(tfp)
     if player_name:
         clauses.append("player_name = ?"); params.append(player_name)
     if session_name:
@@ -1035,7 +2111,7 @@ PHYSICAL_PLAYER_METRICS = [
 _PHYSICAL_MAX_METRICS = {"top_speed", "max_acceleration", "percentage_max_speed"}
 
 
-def get_player_physical_for_match(conn, player_id, match_id):
+def get_player_physical_for_match(conn, player_id, match_id, club_id=None):
     """Return the individual physical/GPS metrics for ONE player in ONE match.
 
     Uses only the physical_data rows linked to ``match_id`` for the given
@@ -1055,10 +2131,17 @@ def get_player_physical_for_match(conn, player_id, match_id):
     """
     if player_id is None or match_id is None:
         return None
-    rows = conn.execute(
-        "SELECT * FROM physical_data WHERE player_id = ? AND match_id = ?",
-        (player_id, match_id),
-    ).fetchall()
+    if club_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM physical_data WHERE player_id = ? AND match_id = ? "
+            "AND club_id = ?",
+            (player_id, match_id, club_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM physical_data WHERE player_id = ? AND match_id = ?",
+            (player_id, match_id),
+        ).fetchall()
     if not rows:
         return None
 
@@ -1135,7 +2218,7 @@ def _merge_physical_session_rows(rows):
     return merged
 
 
-def get_player_physical_aggregate(conn, player_id):
+def get_player_physical_aggregate(conn, player_id, club_id=None):
     """Aggregate a single player's physical/GPS data across ALL their matches.
 
     Uses ONLY the ``physical_data`` rows belonging to ``player_id`` — no team
@@ -1156,9 +2239,15 @@ def get_player_physical_aggregate(conn, player_id):
     """
     if player_id is None:
         return None
-    rows = conn.execute(
-        "SELECT * FROM physical_data WHERE player_id = ?", (player_id,)
-    ).fetchall()
+    if club_id is not None:
+        rows = conn.execute(
+            "SELECT * FROM physical_data WHERE player_id = ? AND club_id = ?",
+            (player_id, club_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM physical_data WHERE player_id = ?", (player_id,)
+        ).fetchall()
     if not rows:
         return None
 
@@ -1205,18 +2294,23 @@ def get_player_physical_aggregate(conn, player_id):
     return result
 
 
-def list_physical_sessions(conn, session_type=None):
+def list_physical_sessions(conn, club_id, session_type=None, team_ids=None):
     """Distinct physical sessions for filters.
 
     Returns one row per (session_name, data_source) with: session_name,
     match_date, data_source, session_type, match_id, n_rows, n_players and the
-    distinct periods present. Optionally filtered by ``session_type``.
+    distinct periods present. Scoped to ``club_id``; optionally filtered by
+    ``session_type`` and ``team_ids`` (Phase 3 team isolation).
     """
-    params = []
-    where = ""
+    params = [club_id]
+    where = "WHERE club_id = ?"
     if session_type:
-        where = "WHERE session_type = ?"
+        where += " AND session_type = ?"
         params.append(session_type)
+    tfrag, tfp = _team_filter_sql(team_ids, "team_id")
+    if tfrag:
+        where += tfrag
+        params.extend(tfp)
     return conn.execute(
         f"""SELECT session_name, MIN(match_date) AS match_date,
                    data_source,
@@ -1233,7 +2327,7 @@ def list_physical_sessions(conn, session_type=None):
     ).fetchall()
 
 
-def get_all_physical_sessions(conn):
+def get_all_physical_sessions(conn, club_id, team_ids=None):
     """List every unique physical session with aggregated info for management.
 
     Returns one dict per (session_name, data_source) with:
@@ -1263,9 +2357,12 @@ def get_all_physical_sessions(conn):
              FROM physical_data pd
              LEFT JOIN matches m ON m.id = pd.match_id
              LEFT JOIN teams   t ON t.id = m.team_id
+            WHERE pd.club_id = ?{tfrag}
             GROUP BY pd.session_name, pd.data_source
             ORDER BY COALESCE(MAX(m.match_date), MIN(pd.match_date)) DESC,
-                     pd.session_name""",
+                     pd.session_name""".format(
+            tfrag=_team_filter_sql(team_ids, "pd.team_id")[0]),
+        (club_id, *_team_filter_sql(team_ids, "pd.team_id")[1]),
     ).fetchall()
 
     sessions = []
@@ -1290,58 +2387,88 @@ def get_all_physical_sessions(conn):
     return sessions
 
 
-def list_physical_players(conn):
-    """Distinct player names present in physical_data."""
+def list_physical_players(conn, club_id, team_ids=None):
+    """Distinct player names present in physical_data for a club."""
+    tfrag, tfp = _team_filter_sql(team_ids, "team_id")
     return [r["player_name"] for r in conn.execute(
-        "SELECT DISTINCT player_name FROM physical_data ORDER BY player_name"
+        f"SELECT DISTINCT player_name FROM physical_data WHERE club_id = ?{tfrag} "
+        f"ORDER BY player_name",
+        (club_id, *tfp),
     ).fetchall()]
 
 
-def get_player_physical_summary(conn, player_name):
+def get_player_physical_summary(conn, player_name, club_id=None):
     """Aggregated physical stats for one player across all sessions.
 
     Sums distances/counts and takes the max of speed-type metrics.
     """
-    row = conn.execute(
-        """SELECT
-              COUNT(DISTINCT session_name) AS sessions,
-              SUM(total_distance)          AS total_distance,
-              SUM(sprint_distance)         AS sprint_distance,
-              SUM(high_intensity_distance) AS high_intensity_distance,
-              SUM(accelerations)           AS accelerations,
-              SUM(decelerations)           AS decelerations,
-              MAX(top_speed)               AS top_speed,
-              MAX(max_acceleration)        AS max_acceleration,
-              AVG(distance_per_minute)     AS avg_distance_per_minute,
-              SUM(session_load)            AS session_load
-           FROM physical_data WHERE player_name = ?""",
-        (player_name,),
-    ).fetchone()
+    if club_id is not None:
+        row = conn.execute(
+            """SELECT
+                  COUNT(DISTINCT session_name) AS sessions,
+                  SUM(total_distance)          AS total_distance,
+                  SUM(sprint_distance)         AS sprint_distance,
+                  SUM(high_intensity_distance) AS high_intensity_distance,
+                  SUM(accelerations)           AS accelerations,
+                  SUM(decelerations)           AS decelerations,
+                  MAX(top_speed)               AS top_speed,
+                  MAX(max_acceleration)        AS max_acceleration,
+                  AVG(distance_per_minute)     AS avg_distance_per_minute,
+                  SUM(session_load)            AS session_load
+               FROM physical_data WHERE player_name = ? AND club_id = ?""",
+            (player_name, club_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT
+                  COUNT(DISTINCT session_name) AS sessions,
+                  SUM(total_distance)          AS total_distance,
+                  SUM(sprint_distance)         AS sprint_distance,
+                  SUM(high_intensity_distance) AS high_intensity_distance,
+                  SUM(accelerations)           AS accelerations,
+                  SUM(decelerations)           AS decelerations,
+                  MAX(top_speed)               AS top_speed,
+                  MAX(max_acceleration)        AS max_acceleration,
+                  AVG(distance_per_minute)     AS avg_distance_per_minute,
+                  SUM(session_load)            AS session_load
+               FROM physical_data WHERE player_name = ?""",
+            (player_name,),
+        ).fetchone()
     return dict(row) if row else {}
 
 
-def physical_summary_counts(conn):
+def physical_summary_counts(conn, club_id, team_ids=None):
     """Top-level counts for the physical dashboard header.
 
     Includes per session_type session counts ('match'/'training'/'unlinked'),
-    where a session is one distinct (session_name, data_source) pair.
+    where a session is one distinct (session_name, data_source) pair. Scoped to
+    ``club_id`` and optionally ``team_ids`` (Phase 3 team isolation).
     """
-    n_rows = conn.execute("SELECT COUNT(*) c FROM physical_data").fetchone()["c"]
+    tfrag, tfp = _team_filter_sql(team_ids, "team_id")
+    n_rows = conn.execute(
+        f"SELECT COUNT(*) c FROM physical_data WHERE club_id = ?{tfrag}",
+        (club_id, *tfp),
+    ).fetchone()["c"]
     n_sessions = conn.execute(
-        "SELECT COUNT(*) c FROM (SELECT 1 FROM physical_data "
-        "GROUP BY session_name, data_source)"
+        f"SELECT COUNT(*) c FROM (SELECT 1 FROM physical_data WHERE club_id = ?{tfrag} "
+        f"GROUP BY session_name, data_source)",
+        (club_id, *tfp),
     ).fetchone()["c"]
     n_players = conn.execute(
-        "SELECT COUNT(DISTINCT player_name) c FROM physical_data"
+        f"SELECT COUNT(DISTINCT player_name) c FROM physical_data "
+        f"WHERE club_id = ?{tfrag}",
+        (club_id, *tfp),
     ).fetchone()["c"]
 
     # Sessions per type (count distinct session_name+data_source per type).
     per_type = {"match": 0, "training": 0, "unlinked": 0}
     rows = conn.execute(
-        "SELECT session_type, COUNT(*) c FROM ("
-        "  SELECT session_type, session_name, data_source FROM physical_data"
-        "  GROUP BY session_name, data_source"
-        ") GROUP BY session_type"
+        f"SELECT session_type, COUNT(*) c FROM ("
+        f"  SELECT session_type, session_name, data_source FROM physical_data"
+        f"  WHERE club_id = ?{tfrag}"
+        f"  GROUP BY session_name, data_source"
+        f") GROUP BY session_type",
+        (club_id, *tfp),
     ).fetchall()
     for r in rows:
         per_type[r["session_type"]] = r["c"]
@@ -1353,99 +2480,125 @@ def physical_summary_counts(conn):
     }
 
 
-def delete_physical_session(conn, session_name, data_source=None):
-    """Delete all physical rows of a session. Returns number of rows removed."""
+def delete_physical_session(conn, session_name, data_source=None, club_id=None):
+    """Delete all physical rows of a session. Returns number of rows removed.
+
+    Scoped to ``club_id`` when provided so a club can only delete its own data.
+    """
+    clauses = ["session_name=?"]
+    params = [session_name]
     if data_source:
-        cur = conn.execute(
-            "DELETE FROM physical_data WHERE session_name=? AND data_source=?",
-            (session_name, data_source),
-        )
-    else:
-        cur = conn.execute(
-            "DELETE FROM physical_data WHERE session_name=?", (session_name,)
-        )
+        clauses.append("data_source=?"); params.append(data_source)
+    if club_id is not None:
+        clauses.append("club_id=?"); params.append(club_id)
+    cur = conn.execute(
+        f"DELETE FROM physical_data WHERE {' AND '.join(clauses)}", params
+    )
     conn.commit()
     return cur.rowcount
 
 
 
-def get_matches_for_date(conn, target_date, window_days=0):
+def get_matches_for_date(conn, target_date, window_days=0, club_id=None,
+                         team_ids=None):
     """Return matches on (or near) a date for match-link suggestions.
 
     Args:
         target_date: ISO date string 'YYYY-MM-DD'.
         window_days: when > 0, also include matches within +/- this many days,
                      ordered by closeness to ``target_date``.
+        club_id:     when provided, only matches of that club are returned.
+        team_ids:    when provided, only matches of those teams are returned
+                     (Phase 3 team isolation).
 
     Returns a list of sqlite Row with: id, match_date, opponent, is_home,
     team_name (joined from teams).
     """
+    club_clause = " AND m.club_id = ?" if club_id is not None else ""
+    tfrag, tfp = _team_filter_sql(team_ids, "m.team_id")
     if window_days and window_days > 0:
+        params = [target_date, window_days, target_date, window_days]
+        if club_id is not None:
+            params.append(club_id)
+        params.extend(tfp)
+        params.append(target_date)
         return conn.execute(
-            """SELECT m.id, m.match_date, m.opponent, m.is_home,
+            f"""SELECT m.id, m.match_date, m.opponent, m.is_home,
                       t.name AS team_name
                  FROM matches m JOIN teams t ON t.id = m.team_id
                 WHERE m.match_date BETWEEN date(?, '-' || ? || ' days')
                                        AND date(?, '+' || ? || ' days')
+                                       {club_clause}{tfrag}
                 ORDER BY ABS(julianday(m.match_date) - julianday(?))""",
-            (target_date, window_days, target_date, window_days, target_date),
+            params,
         ).fetchall()
+    params = [target_date]
+    if club_id is not None:
+        params.append(club_id)
+    params.extend(tfp)
     return conn.execute(
-        """SELECT m.id, m.match_date, m.opponent, m.is_home,
+        f"""SELECT m.id, m.match_date, m.opponent, m.is_home,
                   t.name AS team_name
              FROM matches m JOIN teams t ON t.id = m.team_id
-            WHERE m.match_date = ?
+            WHERE m.match_date = ?{club_clause}{tfrag}
             ORDER BY m.match_date DESC""",
-        (target_date,),
+        params,
     ).fetchall()
 
 
 def link_physical_session_to_match(conn, session_name, data_source, match_id,
-                                   new_session_name=None):
+                                   new_session_name=None, club_id=None):
     """Link a physical session to a match.
 
     Sets ``session_type='match'`` and fills ``match_id`` for every row of the
     given (session_name, data_source). Optionally renames the session via
     ``new_session_name`` (e.g. "vs KV Mechelen (14-03-2026)").
 
+    Scoped to ``club_id`` when provided so only the owning club's rows update,
+    and the target match must belong to the same club.
+
     Returns the number of rows updated.
 
-    Raises ValueError if the match does not exist.
+    Raises ValueError if the match does not exist (within the club).
     """
-    m = conn.execute("SELECT id FROM matches WHERE id = ?", (match_id,)).fetchone()
+    if club_id is not None:
+        m = conn.execute(
+            "SELECT id FROM matches WHERE id = ? AND club_id = ?",
+            (match_id, club_id),
+        ).fetchone()
+    else:
+        m = conn.execute(
+            "SELECT id FROM matches WHERE id = ?", (match_id,)
+        ).fetchone()
     if not m:
         raise ValueError(f"Match {match_id} not found")
 
+    sets = "session_type = 'match', match_id = ?"
+    params = [match_id]
     if new_session_name:
-        cur = conn.execute(
-            """UPDATE physical_data
-                  SET session_type = 'match',
-                      match_id = ?,
-                      session_name = ?
-                WHERE session_name = ? AND data_source = ?""",
-            (match_id, new_session_name, session_name, data_source),
-        )
-    else:
-        cur = conn.execute(
-            """UPDATE physical_data
-                  SET session_type = 'match',
-                      match_id = ?
-                WHERE session_name = ? AND data_source = ?""",
-            (match_id, session_name, data_source),
-        )
+        sets += ", session_name = ?"
+        params.append(new_session_name)
+    where = "session_name = ? AND data_source = ?"
+    params.extend([session_name, data_source])
+    if club_id is not None:
+        where += " AND club_id = ?"
+        params.append(club_id)
+    cur = conn.execute(
+        f"UPDATE physical_data SET {sets} WHERE {where}", params
+    )
     conn.commit()
     return cur.rowcount
 
 
 def unlink_physical_session(conn, session_name, data_source=None,
-                            new_session_name=None):
+                            new_session_name=None, club_id=None):
     """Unlink a physical session from a match.
 
     Sets ``session_type='unlinked'`` and ``match_id=NULL`` for every row of the
     given session. When ``data_source`` is None the operation applies to all
     rows matching ``session_name`` (used by the Data Management overview, which
     identifies sessions by ``session_name`` only). Optionally renames the
-    session.
+    session. Scoped to ``club_id`` when provided.
 
     Returns the number of rows updated.
     """
@@ -1460,6 +2613,9 @@ def unlink_physical_session(conn, session_name, data_source=None,
     if data_source:
         where += " AND data_source = ?"
         params.append(data_source)
+    if club_id is not None:
+        where += " AND club_id = ?"
+        params.append(club_id)
 
     cur = conn.execute(
         f"UPDATE physical_data SET {sets} WHERE {where}", params
