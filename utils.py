@@ -2,6 +2,7 @@
 utils.py — Helper functions shared across the app (formatting, charts).
 """
 
+import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 
@@ -223,24 +224,65 @@ def bar_comparison(df, x, y, color, title, barmode="group"):
     return _apply_dark_layout(fig)
 
 
+def _numeric_columns(df, columns):
+    """Return only the columns that exist in ``df`` AND can be treated as numeric.
+
+    A column qualifies when it is already a numeric dtype, or when its values can
+    be coerced to numbers (e.g. an object column that still holds numbers).
+    Columns that do not exist or that are genuinely non-numeric (text, mixed
+    placeholders like "—") are skipped so the styler never calls ``max()``/``min()``
+    on incomparable values.
+    """
+    valid = []
+    for c in columns:
+        if c not in df.columns:
+            continue  # non-existent column -> skip
+        s = df[c]
+        if pd.api.types.is_numeric_dtype(s):
+            valid.append(c)
+            continue
+        # Object/mixed column: keep it only if it contains at least one real number.
+        coerced = pd.to_numeric(s, errors="coerce")
+        if coerced.notna().any():
+            valid.append(c)
+    return valid
+
+
 def highlight_max(df, columns, color="rgba(16,185,129,0.22)"):
-    """Return a pandas Styler that highlights the max value per given column."""
+    """Return a pandas Styler that highlights the max value per given column.
+
+    Only numeric columns are highlighted. Non-existent and non-numeric (text)
+    columns are silently skipped so no error is raised on text data.
+    """
     def _hl(s):
-        is_max = s == s.max()
-        return [f"background-color: {color}; font-weight:600; color:#F1F5F9" if v else "" for v in is_max]
+        numeric = pd.to_numeric(s, errors="coerce")
+        mx = numeric.max(skipna=True)
+        if pd.isna(mx):
+            return ["" for _ in s]
+        is_max = numeric == mx
+        return [f"background-color: {color}; font-weight:600; color:#F1F5F9" if bool(v) else "" for v in is_max]
     sty = df.style
-    valid = [c for c in columns if c in df.columns]
+    valid = _numeric_columns(df, columns)
     if valid:
         sty = sty.apply(_hl, subset=valid)
     return sty
 
 
 def highlight_min(df, columns, color="rgba(239,68,68,0.20)"):
+    """Return a pandas Styler that highlights the min value per given column.
+
+    Only numeric columns are highlighted. Non-existent and non-numeric (text)
+    columns are silently skipped so no error is raised on text data.
+    """
     def _hl(s):
-        is_min = s == s.min()
-        return [f"background-color: {color}; font-weight:600; color:#F1F5F9" if v else "" for v in is_min]
+        numeric = pd.to_numeric(s, errors="coerce")
+        mn = numeric.min(skipna=True)
+        if pd.isna(mn):
+            return ["" for _ in s]
+        is_min = numeric == mn
+        return [f"background-color: {color}; font-weight:600; color:#F1F5F9" if bool(v) else "" for v in is_min]
     sty = df.style
-    valid = [c for c in columns if c in df.columns]
+    valid = _numeric_columns(df, columns)
     if valid:
         sty = sty.apply(_hl, subset=valid)
     return sty
