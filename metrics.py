@@ -12,15 +12,52 @@ Defines:
 The PDF parser normalises both SciSports PDF versions into these metric_keys.
 """
 
-# The 6 Impact Framework v1.0 categories
+# ---------------------------------------------------------------------------
+# Impact Framework v2.1 — metric-level position profiles
+# ---------------------------------------------------------------------------
+# The 6 FIELD-player categories (Goalkeeping is keeper-only and handled apart).
+#   * "Ball Progression" was previously "Progression"
+#   * "Goalscoring"      was previously "Finishing" and now ALSO contains Assists
+#   * "Physical"         is new (GPS / tracking metrics)
+# These 6 are the categories shown in radars and used for the Profile Balance
+# (validated 35-40). The first FIVE are the *technical* categories that make up
+# the Impact Score and are subject to the 35% category cap; "Physical" is scored
+# separately as the Physical Contribution (Impact Score+ = Impact Score +
+# Physical Contribution) and is NOT capped.
 CATEGORIES = [
     "Passing",
-    "Progression",
+    "Ball Progression",
     "Chance Creation",
-    "Finishing",
+    "Goalscoring",
     "Defending",
-    "Goalkeeping",
+    "Physical",
 ]
+
+# The 5 technical categories: Impact Score + 35% cap operate on these.
+TECHNICAL_CATEGORIES = [
+    "Passing",
+    "Ball Progression",
+    "Chance Creation",
+    "Goalscoring",
+    "Defending",
+]
+
+# Physical category name (the 6th field category, scored separately).
+PHYSICAL_CATEGORY = "Physical"
+
+# Goalkeeping is a keeper-only category that keeps the *old* category-level
+# scoring route (no Profile Balance, no cap, no Physical). It is intentionally
+# NOT part of CATEGORIES (which describes field players).
+GOALKEEPING_CATEGORY = "Goalkeeping"
+
+# The 35% cap ceiling applied to each technical category's share of the
+# (technical) Impact Score.
+CATEGORY_CAP = 0.35
+
+# Profile Balance validation window (sum of the 6 field-category weight means).
+BALANCE_MIN = 35.0
+BALANCE_MAX = 40.0
+BALANCE_TARGET = 37.5
 
 # action_group used for offensive / defensive efficiency calculations
 OFFENSIVE = "offensive"
@@ -41,7 +78,7 @@ METRICS = [
      "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.0, "context": True},
     {"key": "total_actions", "label": "Total Actions", "category": "Passing",
      "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.0, "context": True},
-    {"key": "offensive_actions", "label": "Offensive Actions", "category": "Progression",
+    {"key": "offensive_actions", "label": "Offensive Actions", "category": "Ball Progression",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 0.0, "context": True},
     {"key": "defensive_actions", "label": "Defensive Actions", "category": "Defending",
      "sign": 1, "action_group": DEFENSIVE, "is_pct": False, "base_weight": 0.0, "context": True},
@@ -49,15 +86,15 @@ METRICS = [
     # ---------------- Finishing -------------------------------------------
     # Base weights for goals/assists/xG were reduced in v2 so that pure output
     # no longer dominates every profile's ranking (see weight_tuning_summary.md).
-    {"key": "goals", "label": "Goals", "category": "Finishing",
+    {"key": "goals", "label": "Goals", "category": "Goalscoring",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 4.5},
-    {"key": "assists", "label": "Assists", "category": "Chance Creation",
+    {"key": "assists", "label": "Assists", "category": "Goalscoring",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 3.5},
-    {"key": "shots", "label": "Shots", "category": "Finishing",
+    {"key": "shots", "label": "Shots", "category": "Goalscoring",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 1.0},
-    {"key": "shots_on_target", "label": "Shots on Target", "category": "Finishing",
+    {"key": "shots_on_target", "label": "Shots on Target", "category": "Goalscoring",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 2.0},
-    {"key": "xg", "label": "Expected Goals (xG)", "category": "Finishing",
+    {"key": "xg", "label": "Expected Goals (xG)", "category": "Goalscoring",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 2.5},
 
     # ---------------- Chance Creation -------------------------------------
@@ -77,21 +114,21 @@ METRICS = [
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 1.0},
 
     # ---------------- Progression -----------------------------------------
-    {"key": "forward_passes", "label": "Forward / Direct Passes", "category": "Progression",
+    {"key": "forward_passes", "label": "Forward / Direct Passes", "category": "Ball Progression",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 1.0},
-    {"key": "forward_passes_pct", "label": "Forward Pass %", "category": "Progression",
+    {"key": "forward_passes_pct", "label": "Forward Pass %", "category": "Ball Progression",
      "sign": 1, "action_group": NEUTRAL, "is_pct": True, "base_weight": 0.02},
-    {"key": "passes_final_third", "label": "Passes to Final 3rd", "category": "Progression",
+    {"key": "passes_final_third", "label": "Passes to Final 3rd", "category": "Ball Progression",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 1.2},
-    {"key": "passes_final_third_pct", "label": "Final 3rd Pass %", "category": "Progression",
+    {"key": "passes_final_third_pct", "label": "Final 3rd Pass %", "category": "Ball Progression",
      "sign": 1, "action_group": NEUTRAL, "is_pct": True, "base_weight": 0.02},
-    {"key": "dribbles", "label": "Dribbles", "category": "Progression",
+    {"key": "dribbles", "label": "Dribbles", "category": "Ball Progression",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 0.8},
-    {"key": "forward_dribbles", "label": "Forward Dribbles", "category": "Progression",
+    {"key": "forward_dribbles", "label": "Forward Dribbles", "category": "Ball Progression",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 1.0},
-    {"key": "box_entries", "label": "Box Entries (Penetrations/Receptions)", "category": "Progression",
+    {"key": "box_entries", "label": "Box Entries (Penetrations/Receptions)", "category": "Ball Progression",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 1.5},
-    {"key": "final_third_receptions", "label": "Final 3rd Receptions", "category": "Progression",
+    {"key": "final_third_receptions", "label": "Final 3rd Receptions", "category": "Ball Progression",
      "sign": 1, "action_group": OFFENSIVE, "is_pct": False, "base_weight": 0.8},
 
     # ---------------- Passing ---------------------------------------------
@@ -147,7 +184,37 @@ METRICS = [
      "sign": 1, "action_group": DEFENSIVE, "is_pct": False, "base_weight": 2.0},
     {"key": "goalkicks", "label": "Goalkicks", "category": "Goalkeeping",
      "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.2},
+
+    # ---------------- Physical (GPS / tracking) ---------------------------
+    # New in v2.1. These are scored separately as the "Physical Contribution"
+    # (Impact Score+ = Impact Score + Physical Contribution) and are NOT subject
+    # to the 35% technical-category cap. Raw GPS values are large, so base
+    # weights are deliberately small (see PHYSICAL_STAT_MAP for the
+    # physical_data column each phys_* key is sourced from). base_weight values
+    # are an initial calibration (see design doc, open point #1).
+    {"key": "phys_total_distance", "label": "Total Distance", "category": "Physical",
+     "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.0003},
+    {"key": "phys_high_speed_running", "label": "High Speed Running", "category": "Physical",
+     "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.004},
+    {"key": "phys_sprint_distance", "label": "Sprint Distance", "category": "Physical",
+     "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.006},
+    {"key": "phys_accelerations", "label": "Accelerations", "category": "Physical",
+     "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.05},
+    {"key": "phys_decelerations", "label": "Decelerations", "category": "Physical",
+     "sign": 1, "action_group": NEUTRAL, "is_pct": False, "base_weight": 0.05},
 ]
+
+# Maps each Physical metric_key to the physical_data column it is sourced from.
+# The adapter (impact_engine / database) uses this to inject phys_* values into
+# the stats dict before scoring the Physical Contribution.
+PHYSICAL_STAT_MAP = {
+    "phys_total_distance": "total_distance",
+    "phys_high_speed_running": "high_intensity_distance",
+    "phys_sprint_distance": "sprint_distance",
+    "phys_accelerations": "accelerations",
+    "phys_decelerations": "decelerations",
+}
+PHYSICAL_METRIC_KEYS = list(PHYSICAL_STAT_MAP.keys())
 
 # quick lookups
 METRIC_BY_KEY = {m["key"]: m for m in METRICS}
@@ -160,11 +227,166 @@ CONTEXT_KEYS = {m["key"] for m in METRICS if m.get("context")}
 
 
 def metrics_by_category():
-    """Return {category: [metric, ...]} preserving METRICS order."""
+    """Return {category: [metric, ...]} preserving METRICS order.
+
+    Includes the 6 field CATEGORIES plus the keeper-only Goalkeeping category
+    (setdefault keeps this robust if new categories are added).
+    """
     out = {c: [] for c in CATEGORIES}
     for m in METRICS:
+        out.setdefault(m["category"], []).append(m)
+    return out
+
+
+# ===========================================================================
+# v2.1 — metric-level position profiles: weights, Profile Balance & 35% cap
+# ===========================================================================
+#
+# A position profile now stores a per-metric weight (0.0–10.0, step 0.5) for
+# every *field* metric. The weight plays the same role the old per-category
+# importance did: 5 = neutral (scoring factor 1.0), 10 = double impact, 0 =
+# ignored. The scoring contribution of a metric is:
+#       value * base_weight * (weight / 5.0) * sign
+# ---------------------------------------------------------------------------
+
+def field_metric_keys(include_context=False):
+    """Metric keys for the 6 FIELD categories (excludes Goalkeeping).
+
+    Context metrics (minutes, total actions, …) are excluded unless
+    ``include_context`` is True. These are the metrics the Profile Editor shows
+    and the metrics a metric-level position profile stores a weight for.
+    """
+    keys = []
+    for m in METRICS:
+        if m["category"] not in CATEGORIES:
+            continue
+        if not include_context and m["key"] in CONTEXT_KEYS:
+            continue
+        keys.append(m["key"])
+    return keys
+
+
+def field_metrics_by_category(include_context=False):
+    """{category: [metric, ...]} for the 6 field categories only."""
+    out = {c: [] for c in CATEGORIES}
+    for m in METRICS:
+        if m["category"] not in CATEGORIES:
+            continue
+        if not include_context and m["key"] in CONTEXT_KEYS:
+            continue
         out[m["category"]].append(m)
     return out
+
+
+def category_weight_means(metric_weights):
+    """Mean stored weight (0–10) per field category.
+
+    ``metric_weights`` is {metric_key: weight}. Only non-context field metrics
+    count. A category with no metrics resolves to 0.0 (defensive).
+    Returns {category: mean_weight} over the 6 field CATEGORIES.
+    """
+    metric_weights = metric_weights or {}
+    by_cat = field_metrics_by_category()
+    means = {}
+    for cat, ms in by_cat.items():
+        vals = [float(metric_weights.get(m["key"], 0.0)) for m in ms]
+        means[cat] = (sum(vals) / len(vals)) if vals else 0.0
+    return means
+
+
+def profile_balance(metric_weights):
+    """Profile Balance = Σ of the 6 field-category weight means."""
+    return round(sum(category_weight_means(metric_weights).values()), 4)
+
+
+def validate_position_balance(metric_weights):
+    """Validate a position's metric weights against the 35–40 balance window.
+
+    Returns (ok: bool, total: float, status: str) where status is one of
+    'low' / 'ok' / 'high'. Rounded to 2 decimals with a tiny tolerance so a
+    value landing exactly on a boundary by floating point passes.
+    """
+    total = round(profile_balance(metric_weights), 2)
+    if total < BALANCE_MIN - 1e-6:
+        return False, total, "low"
+    if total > BALANCE_MAX + 1e-6:
+        return False, total, "high"
+    return True, total, "ok"
+
+
+def build_scoring_weights(metric_weights):
+    """Translate stored metric weights (0–10) into compute_impact() weights.
+
+    Effective scoring weight for a metric = base_weight * (weight / 5.0).
+    Context metrics resolve to 0. Metrics not present default to neutral (5.0)
+    so a freshly-seeded sparse profile still scores sensibly. Includes every
+    metric (field + goalkeeping + physical) so the same helper works for all
+    routes; callers decide which metrics' stats they feed in.
+    """
+    metric_weights = metric_weights or {}
+    out = {}
+    for m in METRICS:
+        k = m["key"]
+        if k in CONTEXT_KEYS:
+            out[k] = 0.0
+            continue
+        w = metric_weights.get(k, 5.0)
+        try:
+            w = float(w)
+        except (TypeError, ValueError):
+            w = 5.0
+        out[k] = round(m["base_weight"] * (w / 5.0), 6)
+    return out
+
+
+def apply_category_cap(contribs, cap=CATEGORY_CAP):
+    """Apply the 35% category cap to technical-category contributions.
+
+    Args:
+        contribs: {category: raw_contribution} for the technical categories.
+        cap:      ceiling as a fraction of the total (default 0.35).
+
+    Returns ``(capped, pinned, raw)``:
+        capped: {category: contribution_after_cap_and_redistribution}
+        pinned: set of categories that were capped
+        raw:    {category: original_uncapped_contribution} (for transparency)
+
+    The total is preserved: any surplus from a capped category is redistributed
+    proportionally over the non-pinned categories. Only positive contributions
+    participate (negative/zero contributions cannot exceed a positive cap and
+    receive no redistribution). Converges in ≤ a few passes (max 2 categories
+    can exceed 35%). When the total is ≤ 0 the contributions are returned
+    unchanged.
+    """
+    raw = {c: float(v) for c, v in (contribs or {}).items()}
+    capped = dict(raw)
+    pinned = set()
+    total = sum(capped.values())
+    if total <= 0:
+        return capped, pinned, raw
+
+    cap_value = cap * total
+    # Iterate: pin any category above the ceiling, redistribute the surplus over
+    # the remaining (non-pinned, positive) categories. total stays constant so
+    # cap_value is stable and the loop converges.
+    for _ in range(6):
+        over = [c for c in capped
+                if c not in pinned and capped[c] > cap_value + 1e-9]
+        if not over:
+            break
+        surplus = 0.0
+        for c in over:
+            surplus += capped[c] - cap_value
+            capped[c] = cap_value
+            pinned.add(c)
+        pool = {c: capped[c] for c in capped
+                if c not in pinned and capped[c] > 0}
+        pool_sum = sum(pool.values())
+        if pool_sum <= 0:
+            break
+        for c, v in pool.items():
+            capped[c] += surplus * (v / pool_sum)
+    return capped, pinned, raw
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +615,78 @@ def default_position_category_importances():
     for pos in POSITIONS:
         grp = POSITION_GROUP.get(pos, "centremid")
         out[pos] = dict(_GROUP_CATEGORY_DEFAULTS[grp])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v2.1 — default per-position FIELD-category targets (metric-level profiles).
+#
+# Each tactical group has a 6-category target (Passing, Ball Progression,
+# Chance Creation, Goalscoring, Defending, Physical). Every value is a multiple
+# of 0.5 and the six values sum to exactly 37.5 (BALANCE_TARGET). When every
+# metric in a category is seeded to its category target, the category mean
+# equals the target and the Profile Balance lands on 37.5 exactly.
+# (Goalkeepers keep the legacy category-level route, so they have no field
+# metric-weight defaults here.)
+# ---------------------------------------------------------------------------
+_GROUP_FIELD_TARGETS = {
+    #              Passing  BallProg ChanceCr Goalsc Defend Physical  (Σ=37.5)
+    "fullback":   {"Passing": 6.5, "Ball Progression": 6.5, "Chance Creation": 5.5,
+                   "Goalscoring": 3.5, "Defending": 8.0, "Physical": 7.5},
+    "centreback": {"Passing": 7.5, "Ball Progression": 5.0, "Chance Creation": 3.0,
+                   "Goalscoring": 3.0, "Defending": 9.0, "Physical": 10.0},
+    "wingback":   {"Passing": 6.0, "Ball Progression": 7.0, "Chance Creation": 6.5,
+                   "Goalscoring": 4.0, "Defending": 7.0, "Physical": 7.0},
+    "defmid":     {"Passing": 8.0, "Ball Progression": 6.5, "Chance Creation": 4.0,
+                   "Goalscoring": 3.0, "Defending": 8.5, "Physical": 7.5},
+    "centremid":  {"Passing": 8.0, "Ball Progression": 7.0, "Chance Creation": 6.0,
+                   "Goalscoring": 4.5, "Defending": 6.5, "Physical": 5.5},
+    "attmid":     {"Passing": 7.0, "Ball Progression": 7.0, "Chance Creation": 8.5,
+                   "Goalscoring": 6.5, "Defending": 4.0, "Physical": 4.5},
+    "winger":     {"Passing": 6.0, "Ball Progression": 7.5, "Chance Creation": 8.5,
+                   "Goalscoring": 6.0, "Defending": 4.0, "Physical": 5.5},
+    "striker":    {"Passing": 5.5, "Ball Progression": 5.5, "Chance Creation": 7.5,
+                   "Goalscoring": 9.0, "Defending": 3.5, "Physical": 6.5},
+}
+
+
+def _field_targets_for_position(position):
+    """Return the 6 field-category targets for a position (centremid fallback)."""
+    grp = POSITION_GROUP.get(position, "centremid")
+    return dict(_GROUP_FIELD_TARGETS.get(grp, _GROUP_FIELD_TARGETS["centremid"]))
+
+
+def metric_weights_from_category_targets(category_targets):
+    """Seed every field metric to its category's target weight.
+
+    ``category_targets`` is {field_category: target_weight(0-10)}. Returns
+    {metric_key: weight} for all non-context field metrics. Context and
+    goalkeeping metrics are excluded (the metric-level profile is field-only).
+    Because every metric in a category gets the same value, the category mean
+    equals the target and Σ(means) equals Σ(targets).
+    """
+    category_targets = category_targets or {}
+    out = {}
+    for m in METRICS:
+        if m["category"] not in CATEGORIES or m["key"] in CONTEXT_KEYS:
+            continue
+        out[m["key"]] = float(category_targets.get(m["category"], 5.0))
+    return out
+
+
+def default_position_metric_weights():
+    """Return {position: {metric_key: weight}} for all FIELD positions.
+
+    Each position's weights are seeded from its tactical group's field-category
+    targets so the Profile Balance is exactly 37.5. Goalkeepers are excluded
+    (they use the legacy category route).
+    """
+    out = {}
+    for pos in POSITIONS:
+        if POSITION_GROUP.get(pos) == "goalkeeper":
+            continue
+        out[pos] = metric_weights_from_category_targets(
+            _field_targets_for_position(pos))
     return out
 
 

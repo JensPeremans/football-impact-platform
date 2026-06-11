@@ -27,6 +27,7 @@ import physical_parser as PP
 import impact_engine as IE
 import metrics as M
 import utils as U
+import ui as UI
 
 st.set_page_config(page_title="Football Impact Platform", page_icon="⚽",
                    layout="wide", initial_sidebar_state="expanded")
@@ -55,6 +56,17 @@ def conn():
 def _club():
     """Return the club_id of the currently logged-in user (or None)."""
     return st.session_state.get("club_id")
+
+
+def _club_color():
+    """Return the current club's accent colour (hex), falling back to default."""
+    cid = _club()
+    if cid is None:
+        return UI.DEFAULT_PRIMARY
+    try:
+        return db.get_club_branding(conn(), cid)
+    except Exception:
+        return UI.DEFAULT_PRIMARY
 
 
 def _team_ids():
@@ -143,6 +155,13 @@ def screen_login():
             st.error("Your account has been deactivated. Contact your club admin.")
         elif err == "club_inactive":
             st.error("This club is currently inactive. Contact the platform admin.")
+        elif err == "trial_expired":
+            st.error("⏳ Je proefperiode van 7 dagen is verlopen. "
+                     "Kies een abonnement of neem contact op met de platform admin "
+                     "om je toegang te activeren.")
+        elif err == "subscription_inactive":
+            st.error("🚫 Geen actief abonnement. Je toegang is inactief, geannuleerd "
+                     "of verlopen. Neem contact op met de platform admin.")
         else:
             st.error("Invalid username or password.")
 
@@ -278,22 +297,86 @@ def scoring_selector(c, key, label="Scoring profile"):
     chosen = st.selectbox(label, options, index=0, key=key)
     kind, prof = mapping[chosen]
     if kind == "position":
+        imps = db.get_position_profile_importances(c, prof["id"])
         return {"kind": "position", "profile": prof,
-                "importances": db.get_position_profile_importances(c, prof["id"])}
+                "importances": imps,
+                # Keepers keep the legacy category route via gk_importances.
+                "gk_importances": imps,
+                # Field players use the granular per-metric weights (v2.1).
+                "metric_weights": db.get_position_metric_weights(c, prof["id"])}
     return {"kind": "legacy", "profile": prof,
             "weights": db.get_profile_weights(c, prof["id"])}
 
 
-def score_match_rows(rows, scorer):
+def _physical_stats_for(c, club_id, player_id, match_id):
+    """Return {phys_metric_key: value} for a player-match, or None when absent."""
+    if player_id is None or match_id is None:
+        return None
+    phys = db.get_player_physical_for_match(c, player_id, match_id, club_id)
+    if not phys:
+        return None
+    out = {}
+    for mkey, col in M.PHYSICAL_STAT_MAP.items():
+        v = phys.get(col)
+        if v is not None:
+            out[mkey] = v
+    return out or None
+
+
+def _make_physical_provider(c, club_id, player_id=None, match_id=None):
+    """Build a callable(row) -> physical stats dict (or None) for scoring.
+
+    For match dashboards pass a fixed ``match_id`` (player_id comes from each
+    row); for a single player's history pass a fixed ``player_id`` (match_id
+    comes from each row).
+    """
+    def provider(row):
+        pid = player_id if player_id is not None else row.get("player_id")
+        mid = match_id if match_id is not None else row.get("match_id")
+        return _physical_stats_for(c, club_id, pid, mid)
+    return provider
+
+
+def score_match_rows(rows, scorer, physical_provider=None):
     if scorer and scorer["kind"] == "position":
-        return IE.compute_player_match_rows_positional(rows, scorer["importances"])
+        return IE.compute_player_match_rows_metric(
+            rows, scorer.get("metric_weights", {}),
+            scorer.get("gk_importances", scorer.get("importances", {})),
+            physical_by_row=physical_provider)
     return IE.compute_player_match_rows(rows, (scorer or {}).get("weights", {}))
 
 
-def career_sum(history, scorer):
+def career_sum(history, scorer, physical_provider=None):
     if scorer and scorer["kind"] == "position":
-        return IE.career_summary_positional(history, scorer["importances"])
+        return IE.career_summary_metric(
+            history, scorer.get("metric_weights", {}),
+            scorer.get("gk_importances", scorer.get("importances", {})),
+            physical_by_row=physical_provider)
     return IE.career_summary(history, (scorer or {}).get("weights", {}))
+
+
+def _render_impact_plus_summary(rows):
+    """Show Physical Contribution + Impact Score+ averages, or a 'no data' note.
+
+    Per the v2.1 design: when NO match has physical data, only the Impact Score
+    is shown (already rendered by the caller) plus an explicit message. We never
+    show a "Physical Contribution: 0" or a fake Impact Score+.
+    """
+    phys_rows = [r for r in rows
+                 if (r.get("impact") or {}).get("has_physical")]
+    if not phys_rows:
+        st.caption("ℹ️ Geen fysieke data beschikbaar voor Impact Score+.")
+        return
+    n = len(phys_rows)
+    avg_phys = sum(r["impact"]["physical_contribution"] for r in phys_rows) / n
+    avg_plus = sum(r["impact"]["impact_plus"] for r in phys_rows) / n
+    cc1, cc2, cc3 = st.columns(4)[:3]
+    cc1.metric("Avg Physical Contribution", round(avg_phys, 1))
+    cc2.metric(
+        "Avg Impact Score+", round(avg_plus, 1),
+        help=("Impact Score+ = Impact Score + Physical Contribution. "
+              f"Gebaseerd op {n} wedstrijd(en) met GPS-data."))
+    cc3.metric("Wedstrijden met GPS", n)
 
 
 # Legacy / generic SciSports position labels (pre-Sprint-2 data) mapped to a
@@ -505,7 +588,8 @@ def _render_import_confirmation(c):
 # Screen 1 — Upload & Overview
 # ---------------------------------------------------------------------------
 def screen_upload():
-    st.header("📤 Upload & Overview")
+    UI.page_header("Upload & Overview", "Importeer SciSports-rapporten en beheer je wedstrijden.",
+                   crumb="📊 Matches")
     st.caption("Upload SciSports Match Analysis (Player Version) PDFs. "
                "Both report formats are supported and parsed automatically.")
 
@@ -651,7 +735,7 @@ def _render_position_editor(c, rows):
                 "pms_id": pms_id,
                 "Player": r["player_name"],
                 "Position": pos,
-                "Total Impact": r["impact"]["total_impact"],
+                "Impact Score": r["impact"]["total_impact"],
             })
 
         edit_df = pd.DataFrame(edit_rows)
@@ -666,8 +750,8 @@ def _render_position_editor(c, rows):
                 "Position": st.column_config.SelectboxColumn(
                     "Position", options=positions, required=True,
                     help="Pick from the canonical positions defined in metrics.py."),
-                "Total Impact": st.column_config.NumberColumn(
-                    "Total Impact", disabled=True,
+                "Impact Score": st.column_config.NumberColumn(
+                    "Impact Score", disabled=True,
                     help="Live score for the current position."),
             },
         )
@@ -692,19 +776,32 @@ def _render_position_editor(c, rows):
 
 
 def screen_match():
-    st.header("📊 Match Dashboard")
+    UI.page_header("Match Dashboard", "Line-up, Impact Scores en teamtotalen per wedstrijd.",
+                   crumb="📊 Matches")
     c = conn()
     matches = db.list_matches(c, _club(), team_ids=_team_ids())
     if not matches:
-        st.info("No matches available. Upload PDFs in the Upload & Overview screen.")
+        UI.empty_state(
+            "📊", "Nog geen wedstrijden",
+            "Upload eerst een SciSports-rapport via Upload & Overview om wedstrijddata te zien.")
         return
 
     labels = {U.match_label(m): m for m in matches}
+    label_list = list(labels.keys())
+
+    # Honour a preselected match id (e.g. from the Dashboard "Bekijk" buttons).
+    pre_idx = 0
+    pre_id = st.session_state.pop("preselect_match_id", None)
+    if pre_id is not None:
+        for i, m in enumerate(labels.values()):
+            if m["id"] == pre_id:
+                pre_idx = i
+                break
 
     # --- Compact header: selectors on one row, match meta on the next ---
     hc1, hc2 = st.columns([3, 2])
     with hc1:
-        sel = st.selectbox("Select match", list(labels.keys()))
+        sel = st.selectbox("Select match", label_list, index=pre_idx)
     match = labels[sel]
     with hc2:
         scorer = scoring_selector(c, key="match_profile")
@@ -728,7 +825,9 @@ def screen_match():
     )
 
     player_stats = db.get_match_player_stats(c, match["id"], _club())
-    rows = score_match_rows(player_stats, scorer)
+    rows = score_match_rows(
+        player_stats, scorer,
+        physical_provider=_make_physical_provider(c, _club(), match_id=match["id"]))
     if not rows:
         st.warning("No player stats for this match.")
         return
@@ -742,9 +841,9 @@ def screen_match():
 
     # --- Phase 4: football pitch visualization ---
     st.subheader("🟢 Line-up & Impact on the pitch")
-    st.caption("Starters are placed by position; colour & number show Total "
-               "Impact. Hover a player for the 6-category breakdown. Bench and "
-               "substitutes are listed on the right.")
+    st.caption("Starters are placed by position; colour & number show the "
+               "Impact Score. Hover a player for the 6-category breakdown. "
+               "Bench and substitutes are listed on the right.")
     starters, bench, came_on = _build_pitch_lists(rows)
     pitch, pheight = U.pitch_html(starters, bench, came_on)
     components.html(pitch, height=pheight, scrolling=False)
@@ -753,7 +852,7 @@ def screen_match():
     agg = IE.aggregate_team_impact(rows)
     st.subheader("Team totals")
     tc1, tc2, tc3 = st.columns(3)
-    tc1.metric("Total Impact", agg["total_impact"])
+    tc1.metric("Totale Impact Score", agg["total_impact"])
     tc2.metric("Offensive Impact", agg["offensive_impact"])
     tc3.metric("Defensive Impact", agg["defensive_impact"])
     st.plotly_chart(
@@ -763,27 +862,44 @@ def screen_match():
     )
 
     # Player ranking
-    st.subheader("Player ranking — by Total Impact")
+    st.subheader("Player ranking — by Impact Score")
+    any_physical = any((r["impact"].get("has_physical")) for r in rows)
+    any_capped = any((r["impact"].get("capped_categories")) for r in rows)
     rank_rows = []
     for r in sorted(rows, key=lambda x: x["impact"]["total_impact"], reverse=True):
         imp = r["impact"]
-        rank_rows.append({
+        row = {
             "Player": r["player_name"],
             "Pos": r.get("effective_position") or r["position"],
             "Status": r.get("status") or M.STATUS_STARTER,
             "Min": r["minutes_played"],
-            "Total Impact": imp["total_impact"],
-            "Impact/90": imp["impact_per_90"],
-            "Impact/Action": imp["impact_per_action"],
-            "Off. Eff.": imp["offensive_efficiency"],
-            "Def. Eff.": imp["defensive_efficiency"],
-        })
+            "Impact Score": imp["total_impact"],
+        }
+        # Impact Score+ only meaningful where physical data exists.
+        if any_physical:
+            plus = imp.get("impact_plus")
+            row["Impact Score+"] = plus if plus is not None else "—"
+        row["Impact/90"] = imp["impact_per_90"]
+        row["Impact/Action"] = imp["impact_per_action"]
+        row["Off. Eff."] = imp["offensive_efficiency"]
+        row["Def. Eff."] = imp["defensive_efficiency"]
+        if any_capped:
+            capped = imp.get("capped_categories") or set()
+            row["Cap"] = ("⚠️ " + ", ".join(sorted(capped))) if capped else ""
+        rank_rows.append(row)
     rank_df = pd.DataFrame(rank_rows)
+    highlight_cols = [c for c in ["Impact Score", "Impact Score+", "Impact/90",
+                                  "Impact/Action", "Off. Eff.", "Def. Eff."]
+                      if c in rank_df.columns]
     st.dataframe(
-        U.highlight_max(rank_df, ["Total Impact", "Impact/90", "Impact/Action",
-                                  "Off. Eff.", "Def. Eff."]),
+        U.highlight_max(rank_df, highlight_cols),
         use_container_width=True, hide_index=True,
     )
+    if any_capped:
+        st.caption("⚠️ = categorie afgetopt op 35% van de Impact Score "
+                   "(één categorie mag nooit meer dan 35% wegen).")
+    if not any_physical:
+        st.caption("ℹ️ Geen fysieke data beschikbaar voor Impact Score+.")
 
     # Detailed key metrics
     st.subheader("Player key statistics")
@@ -1071,11 +1187,14 @@ def _render_match_physical(gps_rows):
 # Screen 3 — Player Profile
 # ---------------------------------------------------------------------------
 def screen_player():
-    st.header("👤 Player Profile")
+    UI.page_header("Player Profile", "Impact Score, categorieën en sterktes per speler.",
+                   crumb="👤 Players")
     c = conn()
     players = [p for p in db.list_players(c, _club(), team_ids=_team_ids()) if p["appearances"] > 0]
     if not players:
-        st.info("No players available. Upload PDFs first.")
+        UI.empty_state(
+            "👤", "Nog geen spelers",
+            "Upload eerst een wedstrijdrapport om spelersprofielen te genereren.")
         return
 
     pmap = {p["name"]: p["id"] for p in players}
@@ -1113,24 +1232,40 @@ def screen_player():
         chosen_mid = match_labels[chosen_match]
         history = [r for r in full_history if r["match_id"] == chosen_mid]
 
-    summary = career_sum(history, scorer)
+    summary = career_sum(
+        history, scorer,
+        physical_provider=_make_physical_provider(c, _club(), player_id=pid))
 
-    st.subheader(sel)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Usual position", summary["avg_position"])
-    c2.metric("Matches", summary["matches"])
-    c3.metric("Total minutes", summary["total_minutes"])
-    c4.metric("Goals / Assists", f"{summary['total_goals']} / {summary['total_assists']}")
+    # --- Hero: Impact Score centraal -----------------------------------------
+    pos = summary["avg_position"]
+    pos_variant = {
+        "Goalkeeper": "warning", "Defender": "info",
+        "Midfielder": "success", "Attacker": "danger",
+    }.get(pos, "primary")
+    UI.hero_metric(
+        sel,
+        f"{summary['avg_impact']}",
+        score_label="Gem. Impact Score",
+        secondary=[
+            ("Wedstrijden", str(summary["matches"])),
+            ("Minuten", str(summary["total_minutes"])),
+            ("Goals / Assists", f"{summary['total_goals']} / {summary['total_assists']}"),
+            ("Impact / 90", str(summary["avg_impact_per_90"])),
+            ("Carrière-totaal", str(summary["total_impact"])),
+        ],
+        position=pos,
+        position_variant=pos_variant,
+        avatar_initials=UI.initials(sel),
+    )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Avg Total Impact", summary["avg_impact"])
-    c2.metric("Avg Impact / 90", summary["avg_impact_per_90"])
-    c3.metric("Career Total Impact", summary["total_impact"])
+    # --- v2.1 Impact Score+ (technical Impact Score + Physical Contribution) --
+    _render_impact_plus_summary(summary.get("rows", []))
 
     # --- Verbetering #1: Form indicator (last 5 matches vs season average) ---
     form = IE.form_indicator(summary.get("rows", []), window=5)
+    fc1, _fc2, _fc3, _fc4 = st.columns(4)
     if form["sufficient"]:
-        c4.metric(
+        fc1.metric(
             "Vorm (laatste 5)",
             f"{form['arrow']} {form['pct']:+.0f}%",
             delta=form["label"],
@@ -1140,7 +1275,7 @@ def screen_player():
                   "Last 5 matches vs season average."),
         )
     else:
-        c4.metric(
+        fc1.metric(
             "Vorm (laatste 5)", "—",
             help=("Minimaal 5 wedstrijden nodig om vorm te bepalen "
                   f"(nu {form['matches']}). Insufficient data."),
@@ -1204,8 +1339,11 @@ def screen_player():
                "axes stay comparable; the player's raw per-match average is "
                "shown on hover.")
 
-    drill_cats = [cat for cat in M.CATEGORIES
-                  if cat != "Goalkeeping" or is_keeper]
+    # The 6 field categories drive the drill-down; keepers additionally get the
+    # Goalkeeping category (which is no longer part of M.CATEGORIES).
+    drill_cats = list(M.CATEGORIES)
+    if is_keeper:
+        drill_cats.append(M.GOALKEEPING_CATEGORY)
 
     chosen_cat = st.selectbox("Category to drill into", drill_cats,
                               key="drill_category")
@@ -1252,13 +1390,13 @@ def screen_player():
                 "Minutes": s["total_minutes"],
                 "Avg Impact": s["avg_impact"],
                 "Avg Impact/90": s["avg_impact_per_90"],
-                "Total Impact": s["total_impact"],
+                "Impact Score": s["total_impact"],
                 "Goals": s["total_goals"],
                 "Assists": s["total_assists"],
             })
         st.dataframe(
             U.highlight_max(pd.DataFrame(bp_rows),
-                            ["Avg Impact", "Avg Impact/90", "Total Impact"]),
+                            ["Avg Impact", "Avg Impact/90", "Impact Score"]),
             use_container_width=True, hide_index=True,
         )
         if len(by_pos) > 1:
@@ -1284,7 +1422,7 @@ def screen_player():
             "Pos": r.get("effective_position") or r["position"],
             "Status": r.get("status") or M.STATUS_STARTER,
             "Min": r["minutes_played"],
-            "Total Impact": imp["total_impact"],
+            "Impact Score": imp["total_impact"],
             "Impact/90": imp["impact_per_90"],
             "Goals": int(r["stats"].get("goals") or 0),
             "Assists": int(r["stats"].get("assists") or 0),
@@ -1296,11 +1434,14 @@ def screen_player():
 # Screen 4 — Player Comparison
 # ---------------------------------------------------------------------------
 def screen_comparison():
-    st.header("⚖️ Player Comparison")
+    UI.page_header("Player Comparison", "Vergelijk 2–4 spelers op Impact en categorieën.",
+                   crumb="👥 Players")
     c = conn()
     players = [p for p in db.list_players(c, _club(), team_ids=_team_ids()) if p["appearances"] > 0]
     if len(players) < 2:
-        st.info("Need at least 2 players with data to compare.")
+        UI.empty_state(
+            "⚖️", "Minstens 2 spelers nodig",
+            "Er zijn ten minste twee spelers met wedstrijddata nodig om te vergelijken.")
         return
 
     pmap = {f"{p['name']} ({p['appearances']} apps)": p["id"] for p in players}
@@ -1317,11 +1458,13 @@ def screen_comparison():
         pid = pmap[label]
         name = next(p["name"] for p in players if p["id"] == pid)
         history = db.get_player_match_history(c, pid, _club(), team_ids=_team_ids())
-        summaries[name] = career_sum(history, scorer)
+        summaries[name] = career_sum(
+            history, scorer,
+            physical_provider=_make_physical_provider(c, _club(), player_id=pid))
 
     # Side-by-side table
     st.subheader("Side-by-side (career averages)")
-    table = {"Metric": ["Matches", "Total minutes", "Avg Total Impact",
+    table = {"Metric": ["Matches", "Total minutes", "Avg Impact Score",
                         "Avg Impact/90", "Goals", "Assists",
                         *[f"Cat: {cat}" for cat in M.CATEGORIES]]}
     for name, s in summaries.items():
@@ -1380,7 +1523,7 @@ def screen_comparison():
             st.info("No players have data on this position.")
         else:
             ptable = {"Metric": ["Matches", "Minutes", "Avg Impact",
-                                 "Avg Impact/90", "Total Impact",
+                                 "Avg Impact/90", "Impact Score",
                                  "Goals", "Assists"]}
             for name, s in sub.items():
                 ptable[name] = [s["matches"], s["total_minutes"],
@@ -1408,11 +1551,14 @@ def screen_comparison():
 # Screen 5 — Evolution Dashboard
 # ---------------------------------------------------------------------------
 def screen_evolution():
-    st.header("📈 Evolution Dashboard")
+    UI.page_header("Evolution Dashboard", "Volg de ontwikkeling van een speler over de tijd.",
+                   crumb="👥 Players")
     c = conn()
     players = [p for p in db.list_players(c, _club(), team_ids=_team_ids()) if p["appearances"] > 0]
     if not players:
-        st.info("No players available. Upload PDFs first.")
+        UI.empty_state(
+            "📈", "Nog geen spelers",
+            "Upload eerst wedstrijdrapporten om de evolutie van spelers te tonen.")
         return
 
     pmap = {p["name"]: p["id"] for p in players}
@@ -1422,7 +1568,9 @@ def screen_evolution():
     scorer = scoring_selector(c, key="evo_profile")
 
     history = db.get_player_match_history(c, pid, _club(), team_ids=_team_ids())
-    rows = score_match_rows(history, scorer)
+    rows = score_match_rows(
+        history, scorer,
+        physical_provider=_make_physical_provider(c, _club(), player_id=pid))
     if len(rows) < 1:
         st.info("No match data for this player.")
         return
@@ -1435,7 +1583,7 @@ def screen_evolution():
         rec = {
             "Date": r["match_date"],
             "Opponent": r["opponent"],
-            "Total Impact": imp["total_impact"],
+            "Impact Score": imp["total_impact"],
             "Impact/90": imp["impact_per_90"],
         }
         for cat in M.CATEGORIES:
@@ -1451,15 +1599,15 @@ def screen_evolution():
               "primaire weergave.  Adds 3- and 5-match rolling averages."),
     )
     if show_rolling:
-        st.plotly_chart(U.rolling_line_chart(df, "Date", "Total Impact",
-                                             "Total Impact over time (met rolling averages)"),
+        st.plotly_chart(U.rolling_line_chart(df, "Date", "Impact Score",
+                                             "Impact Score over time (met rolling averages)"),
                         use_container_width=True)
         st.plotly_chart(U.rolling_line_chart(df, "Date", "Impact/90",
                                              "Impact / 90 over time (met rolling averages)"),
                         use_container_width=True)
     else:
-        st.plotly_chart(U.line_chart(df, "Date", "Total Impact",
-                                     "Total Impact over time"), use_container_width=True)
+        st.plotly_chart(U.line_chart(df, "Date", "Impact Score",
+                                     "Impact Score over time"), use_container_width=True)
         st.plotly_chart(U.line_chart(df, "Date", "Impact/90",
                                      "Impact / 90 over time"), use_container_width=True)
 
@@ -1486,7 +1634,8 @@ _SCALE_HELP = (
 
 
 def screen_profile_editor():
-    st.header("🛠️ Profile Editor")
+    UI.page_header("Profile Editor", "Stel positieprofielen en speelstijl-gewichten in.",
+                   crumb="🛠️ Profiles")
     mode = st.radio(
         "What do you want to edit?",
         ["⚽ Position profile (recommended)", "🎚️ Legacy playing-style profile"],
@@ -1499,9 +1648,9 @@ def screen_profile_editor():
 
 
 def _position_profile_editor(c):
-    st.caption("Set how important each of the 6 impact categories is **per "
-               "position**. The same statistics matter differently for a "
-               "goalkeeper than for a striker. " + _SCALE_HELP)
+    st.caption("Stel **per positie** in hoe belangrijk elke individuele statistiek "
+               "is. Veldspelers gebruiken granulaire gewichten per metric; de "
+               "keeper houdt de categorie-gebaseerde instelling. " + _SCALE_HELP)
 
     profiles = db.list_position_profiles(c, _club())
     if not profiles:
@@ -1516,14 +1665,26 @@ def _position_profile_editor(c):
         st.info(prof["description"])
     position = csel2.selectbox("Position", list(M.POSITIONS), key="pp_pos_sel")
 
+    # Keepers keep the legacy category-level importances route.
+    if IE.is_keeper_position(position):
+        _keeper_category_editor(c, prof, position)
+        _profile_editor_footer(c, prof)
+        return
+
+    _metric_weight_editor(c, prof, position)
+    _profile_editor_footer(c, prof)
+
+
+def _keeper_category_editor(c, prof, position):
+    """Legacy category-importance editor (goalkeepers only)."""
     importances = db.get_position_profile_importances(c, prof["id"])
     current = importances.get(position, {})
-
     with st.form(key=f"pp_form_{prof['id']}_{position}"):
-        st.markdown(f"#### {position} — category importance")
+        st.markdown(f"#### {position} — category importance (keeper)")
         new_vals = {}
         cols = st.columns(3)
-        for i, cat in enumerate(M.CATEGORIES):
+        cats = M.TECHNICAL_CATEGORIES + [M.GOALKEEPING_CATEGORY]
+        for i, cat in enumerate(cats):
             with cols[i % 3]:
                 new_vals[cat] = st.slider(
                     cat, min_value=0, max_value=10,
@@ -1537,24 +1698,122 @@ def _position_profile_editor(c):
             st.success(f"Saved category importances for {position} "
                        f"in '{prof['name']}'.")
 
-    # Overview of all positions for this profile
-    with st.expander("📋 Show all positions in this profile"):
+
+def _metric_weight_editor(c, prof, position):
+    """Granular per-metric weight editor with a live Profile Balance bar.
+
+    No st.form is used so the Profile Balance recomputes live as the coach
+    drags sliders. Saving is blocked while the balance is outside 35–40.
+    """
+    stored = db.get_position_metric_weights(c, prof["id"]).get(position, {})
+    by_cat = M.field_metrics_by_category()
+
+    st.markdown(f"#### {position} — gewicht per statistiek")
+
+    # Live values: read straight from the slider widgets (session_state) so the
+    # balance reflects the current on-screen state before saving.
+    new_weights = {}
+    for cat in M.CATEGORIES:
+        cat_metrics = by_cat.get(cat, [])
+        if not cat_metrics:
+            continue
+        cat_mean = _live_category_mean(prof["id"], position, cat_metrics, stored)
+        # Inline section (no expander): an expander would collapse on every
+        # slider change because each adjustment triggers a Streamlit rerun.
+        st.markdown(f"**{cat}** — gemiddeld gewicht {cat_mean:.2f}")
+        cols = st.columns(3)
+        for i, m in enumerate(cat_metrics):
+            k = m["key"]
+            wkey = f"pmw_{prof['id']}_{position}_{k}"
+            if wkey not in st.session_state:
+                st.session_state[wkey] = float(stored.get(k, 5.0))
+            with cols[i % 3]:
+                new_weights[k] = st.slider(
+                    m["label"], min_value=0.0, max_value=10.0, step=0.5,
+                    key=wkey,
+                )
+        st.divider()
+
+    # --- Live Profile Balance bar ------------------------------------------
+    ok, total, status = M.validate_position_balance(new_weights)
+    st.markdown("##### Profile Balance")
+    pct = max(0.0, min(1.0, total / 50.0))
+    st.progress(pct)
+    msg = (f"**Profile Balance: {total:.1f}**  "
+           f"(streefwaarde {M.BALANCE_TARGET}, geldig bereik "
+           f"{M.BALANCE_MIN:.0f}–{M.BALANCE_MAX:.0f})")
+    if status == "ok":
+        st.success("✅ " + msg)
+    elif status == "low":
+        st.error("⬇️ " + msg + " — verhoog enkele gewichten om op te slaan.")
+    else:
+        st.error("⬆️ " + msg + " — verlaag enkele gewichten om op te slaan.")
+
+    # Per-category means table (transparency).
+    means = M.category_weight_means(new_weights)
+    st.caption("Gemiddeld gewicht per categorie: " +
+               " · ".join(f"{c} {means[c]:.2f}" for c in M.CATEGORIES))
+
+    save_col, reset_col = st.columns(2)
+    with save_col:
+        if st.button("💾 Bewaar deze positie", type="primary",
+                     disabled=not ok, key=f"pmw_save_{prof['id']}_{position}"):
+            try:
+                db.update_position_metric_weights(
+                    c, prof["id"], {position: new_weights})
+                st.success(f"Gewichten opgeslagen voor {position} "
+                           f"in '{prof['name']}'.")
+            except ValueError as e:
+                st.error(str(e))
+    with reset_col:
+        if st.button("↩️ Reset deze positie", key=f"pmw_reset_{prof['id']}_{position}"):
+            db.reset_position_metric_weights_to_default(c, prof["id"], position)
+            # Clear slider state so the widgets repopulate from defaults.
+            for m in M.field_metric_keys():
+                st.session_state.pop(f"pmw_{prof['id']}_{position}_{m}", None)
+            st.success("Positie teruggezet naar standaardwaarden.")
+            st.rerun()
+
+
+def _live_category_mean(profile_id, position, cat_metrics, stored):
+    """Mean of the current (live) slider weights for one category."""
+    vals = []
+    for m in cat_metrics:
+        wkey = f"pmw_{profile_id}_{position}_{m['key']}"
+        vals.append(float(st.session_state.get(wkey, stored.get(m["key"], 5.0))))
+    return (sum(vals) / len(vals)) if vals else 0.0
+
+
+def _profile_editor_footer(c, prof):
+    """Shared footer: full-profile reset + duplicate-profile creation."""
+    importances = db.get_position_profile_importances(c, prof["id"])
+    with st.expander("📋 Toon alle posities in dit profiel"):
         ov = []
+        mw_map = db.get_position_metric_weights(c, prof["id"])
         for pos in M.POSITIONS:
             row = {"Position": pos}
-            for cat in M.CATEGORIES:
-                row[cat] = round(float(importances.get(pos, {}).get(cat, 5)), 1)
+            if IE.is_keeper_position(pos):
+                row["Profile Balance"] = "—"
+                row["Type"] = "categorie (keeper)"
+            else:
+                _ok, total, _s = M.validate_position_balance(mw_map.get(pos, {}))
+                row["Profile Balance"] = f"{total:.1f}"
+                row["Type"] = "granulair"
             ov.append(row)
         st.dataframe(pd.DataFrame(ov), use_container_width=True, hide_index=True)
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("↩️ Reset whole profile to defaults", key="pp_reset"):
+        if st.button("↩️ Reset volledig profiel naar standaard", key="pp_reset"):
             db.reset_position_profile_to_default(c, prof["id"])
-            st.success("Reset all positions to framework defaults.")
+            # Drop any cached slider state for this profile.
+            for key in [k for k in st.session_state
+                        if k.startswith(f"pmw_{prof['id']}_")]:
+                st.session_state.pop(key, None)
+            st.success("Alle posities teruggezet naar standaardwaarden.")
             st.rerun()
     with col2:
-        with st.popover("➕ Create new position profile (duplicate)"):
+        with st.popover("➕ Nieuw positieprofiel (kopie)"):
             new_name = st.text_input("New profile name", key="pp_new_name")
             new_desc = st.text_input("Description", key="pp_new_desc",
                                      value=f"Copy of {prof['name']}")
@@ -1565,7 +1824,9 @@ def _position_profile_editor(c):
                     try:
                         club_id = _club()
                         db.create_position_profile(
-                            c, club_id, new_name.strip(), new_desc, importances)
+                            c, club_id, new_name.strip(), new_desc, importances,
+                            metric_weights=db.get_position_metric_weights(
+                                c, prof["id"]))
                         st.success(f"Created '{new_name}'.")
                         st.rerun()
                     except Exception as e:  # noqa
@@ -1702,7 +1963,8 @@ def _confirm_delete_source(group):
 
 
 def screen_data_management():
-    st.header("🗄️ Data Management")
+    UI.page_header("Data Management", "Bekijk uploadgeschiedenis en verwijder data veilig.",
+                   crumb="⚙️ Management")
     st.caption("Review upload history, inspect imported matches, and remove data "
                "with full cascade clean-up. All deletions run inside a transaction.")
 
@@ -1900,7 +2162,8 @@ def _physical_rows_to_df(rows):
 
 
 def screen_physical():
-    st.header("🏃 Physical / GPS Data")
+    UI.page_header("Physical / GPS Data", "Beheer fysieke tracking-data — los van de impact-pijplijn.",
+                   crumb="🏃 Physical")
     st.caption("Aparte pijplijn voor fysieke tracking-data (Catapult CSV & "
                "wedstrijd-XLSX). Volledig los van de impact-/SciSports-data — "
                "upload, controleer, bewaar en visualiseer.")
@@ -2380,6 +2643,27 @@ def screen_physical():
 # Club Management (Phase 2) — club_admin & platform_admin
 # ---------------------------------------------------------------------------
 _LIMIT_MSG = ("Limiet bereikt. Upgrade nodig om meer {what} toe te voegen.")
+_PLAN_LABELS = {
+    "trial": "Trial", "basic": "Basic", "advanced": "Advanced",
+    "pro": "Pro", "elite": "Elite",
+}
+# Next plan up, for a concrete upgrade hint.
+_PLAN_NEXT = {
+    "trial": "basic", "basic": "advanced", "advanced": "pro",
+    "pro": "elite", "elite": None,
+}
+
+
+def _upgrade_msg(plan, what):
+    """Clear, plan-aware upgrade message for the club admin."""
+    nxt = _PLAN_NEXT.get((plan or "").lower())
+    label = _PLAN_LABELS.get((plan or "").lower(), plan)
+    base = (f"⚠️ Je hebt de **{what}**-limiet van je **{label}**-abonnement "
+            f"bereikt.")
+    if nxt:
+        return (base + f" Upgrade naar **{_PLAN_LABELS[nxt]}** voor meer {what}. "
+                "Neem contact op met de platform admin om te upgraden.")
+    return base + " Neem contact op met de platform admin voor meer capaciteit."
 
 
 def _role():
@@ -2403,37 +2687,107 @@ def _render_club_panel(c, club_id):
 
     # ---- A. Club Info ----
     st.markdown(f"### 🏟️ {club['name']}")
-    user_count = db.get_club_user_count(c, club_id)
-    team_count = db.get_club_team_count(c, club_id)
+    info = db.get_club_plan_info(c, club_id)
+    plan_label = _PLAN_LABELS.get(info["plan"], info["plan"])
     ci = st.columns(4)
-    ci[0].metric("Abonnement", club["subscription_status"])
-    ci[1].metric("Gebruikers", f"{user_count} / {club['max_users']}")
-    ci[2].metric("Teams", f"{team_count} / {club['max_teams']}")
-    ci[3].metric("Status", "Actief" if club["is_active"] else "Inactief")
+    ci[0].metric("Abonnement", plan_label)
+    ci[1].metric("Extra gebruikers",
+                 f"{info['extra_user_count']} / {info['max_extra_users']}")
+    ci[2].metric("Teams", f"{info['team_count']} / {info['max_teams']}")
+    status_txt = info["status"].capitalize()
+    if not info["access"]:
+        status_txt += " ⛔"
+    ci[3].metric("Status", status_txt)
+    st.caption("ℹ️ De clubadmin telt niet mee als extra gebruiker.")
+    if info["plan"] == "trial" and info["trial_end_date"]:
+        if info["trial_active"]:
+            st.info(f"🆓 Proefperiode actief t/m {info['trial_end_date'][:10]} "
+                    "(7 dagen).")
+        else:
+            st.warning("⏳ Proefperiode verlopen — geen toegang meer tot login.")
+
+    # ---- A2. Clubkleur (branding) ----
+    with st.container(border=True):
+        st.markdown("#### 🎨 Clubkleur")
+        st.caption("Deze accentkleur kleurt de hele interface — knoppen, "
+                   "highlights, grafieken en de Impact Score.")
+        cur_color = db.get_club_branding(c, club_id)
+        bc1, bc2 = st.columns([1, 3])
+        with bc1:
+            new_color = st.color_picker("Accentkleur", value=cur_color,
+                                        key=f"clubcolor_{club_id}")
+        with bc2:
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:.6rem;"
+                f"margin-top:1.9rem'>"
+                f"<span style='display:inline-block;width:28px;height:28px;"
+                f"border-radius:8px;background:{new_color};"
+                f"border:1px solid rgba(255,255,255,.2)'></span>"
+                f"<code>{new_color}</code></div>",
+                unsafe_allow_html=True)
+        cbtn1, cbtn2 = st.columns([1, 1])
+        if cbtn1.button("💾 Kleur opslaan", key=f"savecolor_{club_id}"):
+            try:
+                db.update_club_branding(c, club_id, new_color)
+                st.session_state.pop(f"clubcolor_{club_id}", None)
+                st.success("Clubkleur bijgewerkt. De nieuwe kleur is direct actief.")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+        if cbtn2.button("↩️ Standaard herstellen", key=f"resetcolor_{club_id}"):
+            db.update_club_branding(c, club_id, db.DEFAULT_PRIMARY_COLOR)
+            st.session_state.pop(f"clubcolor_{club_id}", None)
+            st.success("Clubkleur teruggezet naar standaard (groen).")
+            st.rerun()
 
     # ---- Platform-admin controls for this club ----
     if _is_platform_admin():
-        with st.expander("⚙️ Platform-beheer (limieten & status)"):
-            with st.form(f"limits_{club_id}"):
-                lc = st.columns(3)
-                new_max_users = lc[0].number_input(
-                    "Max gebruikers", min_value=1, max_value=999,
-                    value=int(club["max_users"]), step=1)
-                new_max_teams = lc[1].number_input(
-                    "Max teams", min_value=1, max_value=999,
-                    value=int(club["max_teams"]), step=1)
-                new_status = lc[2].selectbox(
-                    "Abonnement",
-                    ["trial", "active", "suspended", "cancelled"],
-                    index=["trial", "active", "suspended", "cancelled"].index(
-                        club["subscription_status"])
-                    if club["subscription_status"] in
-                    ["trial", "active", "suspended", "cancelled"] else 0)
-                if st.form_submit_button("💾 Limieten opslaan"):
-                    db.update_club_limits(c, club_id, new_max_users,
-                                          new_max_teams)
+        with st.expander("⚙️ Platform-beheer (plan, limieten & status)"):
+            _PLAN_KEYS = list(db.VALID_PLANS)
+            _STATUS_KEYS = list(db.VALID_STATUSES)
+            with st.form(f"plan_{club_id}"):
+                pc = st.columns(2)
+                cur_plan = info["plan"] if info["plan"] in _PLAN_KEYS else "trial"
+                new_plan = pc[0].selectbox(
+                    "Plan", _PLAN_KEYS,
+                    index=_PLAN_KEYS.index(cur_plan),
+                    format_func=lambda p: _PLAN_LABELS.get(p, p))
+                cur_status = (info["status"] if info["status"] in _STATUS_KEYS
+                              else "trial")
+                new_status = pc[1].selectbox(
+                    "Status", _STATUS_KEYS,
+                    index=_STATUS_KEYS.index(cur_status))
+                st.caption("Bij planwijziging worden de limieten automatisch "
+                           "toegepast: Trial 1/1 · Basic 1/1 · Advanced 3/3 · "
+                           "Pro 5/10 · Elite 10/30 (teams / extra users).")
+                lc = st.columns(2)
+                new_max_teams = lc[0].number_input(
+                    "Max teams (override)", min_value=1, max_value=999,
+                    value=int(info["max_teams"]), step=1)
+                new_max_extra = lc[1].number_input(
+                    "Max extra gebruikers (override)", min_value=0,
+                    max_value=999, value=int(info["max_extra_users"]), step=1)
+                cur_end = (info["trial_end_date"] or "")[:10]
+                new_trial_end = st.text_input(
+                    "Trial einddatum (YYYY-MM-DD, leeg = ongewijzigd)",
+                    value=cur_end)
+                if st.form_submit_button("💾 Opslaan"):
+                    plan_changed = new_plan != info["plan"]
+                    if plan_changed:
+                        db.update_club_plan(c, club_id, new_plan)
+                    else:
+                        db.update_club_limits(c, club_id, new_max_teams,
+                                              new_max_extra)
                     db.update_club_subscription(c, club_id, new_status)
-                    st.success("Limieten bijgewerkt.")
+                    if new_trial_end.strip():
+                        try:
+                            iso = new_trial_end.strip()
+                            if len(iso) == 10:
+                                iso += "T23:59:59"
+                            db.update_club_trial_end(c, club_id, iso)
+                        except Exception:
+                            st.warning("Ongeldige datum genegeerd.")
+                    st.success("Plan / limieten / status bijgewerkt.")
                     st.rerun()
             toggle_label = ("🚫 Club deactiveren" if club["is_active"]
                             else "✅ Club activeren")
@@ -2459,7 +2813,9 @@ def _render_club_panel(c, club_id):
 
     at_team_limit = not db.can_add_team(c, club_id)
     if at_team_limit:
-        st.warning("⚠️ " + _LIMIT_MSG.format(what="teams"))
+        st.warning(_upgrade_msg(db.get_club(c, club_id)["subscription_plan"]
+                                if "subscription_plan" in db.get_club(c, club_id).keys()
+                                else "trial", "teams"))
     with st.form(f"add_team_{club_id}", clear_on_submit=True):
         tc = st.columns([2, 1, 1])
         t_name = tc[0].text_input("Teamnaam")
@@ -2519,7 +2875,10 @@ def _render_club_panel(c, club_id):
 
     at_user_limit = not db.can_add_user(c, club_id)
     if at_user_limit:
-        st.warning("⚠️ " + _LIMIT_MSG.format(what="users"))
+        _cp = db.get_club(c, club_id)
+        _plan = (_cp["subscription_plan"] if "subscription_plan" in _cp.keys()
+                 else "trial")
+        st.warning(_upgrade_msg(_plan, "extra gebruikers"))
     teams_for_select = db.list_teams(c, club_id)
     team_opts = {"— Geen team —": None}
     for t in teams_for_select:
@@ -2621,7 +2980,8 @@ def screen_club_management():
         st.error("⛔ Je hebt geen toegang tot clubbeheer.")
         return
 
-    st.title("🏛️ Clubbeheer")
+    UI.page_header("Clubbeheer", "Beheer abonnement, teams, gebruikers en clubkleur.",
+                   crumb="⚙️ Management")
     c = conn()
 
     if _is_platform_admin():
@@ -2631,10 +2991,14 @@ def screen_club_management():
             st.dataframe(
                 pd.DataFrame([
                     {"Club": cl["name"],
-                     "Abonnement": cl["subscription_status"],
-                     "Gebruikers": f"{cl['user_count']} / {cl['max_users']}",
+                     "Plan": _PLAN_LABELS.get(
+                         cl.get("subscription_plan", "trial"),
+                         cl.get("subscription_plan", "trial")),
+                     "Status": cl["subscription_status"],
+                     "Extra users": f"{cl.get('extra_user_count', 0)} / "
+                                    f"{cl.get('max_extra_users', 0)}",
                      "Teams": f"{cl['team_count']} / {cl['max_teams']}",
-                     "Status": "Actief" if cl["is_active"] else "Inactief"}
+                     "Actief": "Ja" if cl["is_active"] else "Nee"}
                     for cl in clubs
                 ]),
                 use_container_width=True, hide_index=True)
@@ -2650,10 +3014,161 @@ def screen_club_management():
         _render_club_panel(c, _club())
 
 
+def _trial_days_left(trial_end):
+    """Whole days remaining until an ISO trial_end date (>=0), or None."""
+    if not trial_end:
+        return None
+    try:
+        from datetime import datetime as _dt
+        end = _dt.fromisoformat(trial_end)
+        delta = end - _dt.now()
+        return max(0, delta.days + (1 if delta.seconds > 0 else 0))
+    except Exception:
+        return None
+
+
+def screen_dashboard():
+    """Club Overview — the landing screen with KPIs, trial status & quick actions."""
+    c = conn()
+    club_id = _club()
+    primary = _club_color()
+    club = db.get_club(c, club_id)
+    club_name = club["name"] if club else "—"
+    user = st.session_state.get("username", "coach")
+
+    import datetime as _d
+    today = _d.date.today().strftime("%d %b %Y")
+    UI.page_header(f"Welkom terug, {user} 👋",
+                   subtitle=f"{club_name} · {today}", crumb="🏠 Dashboard")
+
+    players = db.list_players(c, club_id, team_ids=_team_ids())
+    matches = db.list_matches(c, club_id, team_ids=_team_ids())
+    sessions = db.list_physical_sessions(c, club_id, team_ids=_team_ids())
+    info = db.get_club_plan_info(c, club_id) or {}
+    plan_label = _PLAN_LABELS.get(info.get("plan", "trial"), info.get("plan", "trial"))
+
+    # Empty state for brand-new clubs.
+    if not matches:
+        UI.empty_state(
+            "⚽", "Welkom bij het Impact Platform!",
+            "Je club heeft nog geen data. Begin met deze drie stappen om "
+            "inzichten te ontgrendelen.")
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            st.markdown("##### 1️⃣ Upload wedstrijd")
+            st.caption("Upload je eerste SciSports-rapport (PDF) om spelers en "
+                       "Impact Scores te genereren.")
+            if st.button("📤 Upload je eerste wedstrijd", type="primary",
+                         use_container_width=True, key="dash_empty_upload"):
+                _go("📤 Upload & Overview")
+        with s2:
+            st.markdown("##### 2️⃣ Voeg GPS-data toe")
+            st.caption("Optioneel: upload fysieke/GPS-data om Impact Score+ "
+                       "te activeren.")
+            if st.button("🏃 Physical / GPS", use_container_width=True,
+                         key="dash_empty_phys"):
+                _go("🏃 Physical / GPS")
+        with s3:
+            st.markdown("##### 3️⃣ Stem profielen af")
+            st.caption("Pas positieprofielen aan op jullie speelstijl in de "
+                       "Profile Editor.")
+            if st.button("🛠️ Profile Editor", use_container_width=True,
+                         key="dash_empty_prof"):
+                _go("🛠️ Profile Editor")
+        return
+
+    # KPI row.
+    kpis = [
+        {"icon": "👥", "label": "Spelers", "value": len(players)},
+        {"icon": "📊", "label": "Wedstrijden", "value": len(matches)},
+        {"icon": "🏟️", "label": "Teams",
+         "value": f"{info.get('team_count', 0)} / {info.get('max_teams', 0)}",
+         "progress": (info.get('team_count', 0) / info['max_teams'])
+                     if info.get('max_teams') else None},
+        {"icon": "🏃", "label": "GPS-sessies", "value": len(sessions)},
+        {"icon": "💳", "label": "Abonnement", "value": plan_label,
+         "sub": info.get("status", "").capitalize()},
+    ]
+    UI.kpi_cards(kpis)
+
+    # Trial status card.
+    if info.get("plan") == "trial" and info.get("trial_end_date"):
+        days = _trial_days_left(info["trial_end_date"])
+        active = info.get("trial_active", True)
+        with st.container(border=True):
+            if not active:
+                st.markdown("#### ⛔ Proefperiode verlopen")
+                st.markdown(
+                    UI.badge("Verlopen", "danger") +
+                    " &nbsp; Neem contact op met je clubadmin om te upgraden.",
+                    unsafe_allow_html=True)
+            else:
+                variant = ("success" if (days or 0) > 7
+                           else "warning" if (days or 0) >= 3 else "danger")
+                st.markdown(
+                    f"#### 🆓 Proefperiode &nbsp; " +
+                    UI.badge(f"{days} dagen resterend", variant),
+                    unsafe_allow_html=True)
+                total = 7.0
+                used = max(0.0, min(1.0, (total - (days or 0)) / total))
+                st.progress(used)
+                st.caption(f"Actief t/m {info['trial_end_date'][:10]}")
+                if _is_club_admin() or _is_platform_admin():
+                    if st.button("💳 Bekijk abonnementen", key="dash_trial_cta"):
+                        _go("🏛️ Club Management")
+
+    # Quick actions.
+    st.markdown("##### ⚡ Snelle acties")
+    qa = st.columns(4)
+    with qa[0]:
+        if st.button("📤 Upload wedstrijd", use_container_width=True,
+                     key="dash_qa_upload"):
+            _go("📤 Upload & Overview")
+    with qa[1]:
+        if st.button("🏃 GPS-data", use_container_width=True, key="dash_qa_gps"):
+            _go("🏃 Physical / GPS")
+    with qa[2]:
+        if (_is_club_admin() or _is_platform_admin()):
+            if st.button("👥 Beheer club", use_container_width=True,
+                         key="dash_qa_club"):
+                _go("🏛️ Club Management")
+        else:
+            if st.button("👤 Speler-profielen", use_container_width=True,
+                         key="dash_qa_player"):
+                _go("👤 Player Profile")
+    with qa[3]:
+        if st.button("🛠️ Profiles", use_container_width=True, key="dash_qa_prof"):
+            _go("🛠️ Profile Editor")
+
+    # Recent matches.
+    recent = matches[:5]
+    if recent:
+        st.markdown("##### 📅 Recente wedstrijden")
+        for m in recent:
+            cols = st.columns([3, 2, 2, 1.4])
+            cols[0].markdown(f"**{m['match_date']}** · {m['team_name']}")
+            cols[1].markdown(f"vs {m['opponent']}")
+            res = U.result_for_home(m)
+            res_variant = {"W": "success", "L": "danger", "D": "neutral"}.get(res, "neutral")
+            cols[2].markdown(
+                f"{U.fmt_score(m)} &nbsp; " + UI.badge(res, res_variant),
+                unsafe_allow_html=True)
+            if cols[3].button("Bekijk", key=f"dash_match_{m['id']}"):
+                st.session_state["preselect_match_id"] = m["id"]
+                _go("📊 Match Dashboard")
+
+
+def _go(nav_label):
+    """Set the active navigation target and rerun."""
+    st.session_state["nav"] = nav_label
+    st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
 SCREENS = {
+    "🏠 Dashboard": screen_dashboard,
     "📤 Upload & Overview": screen_upload,
     "📊 Match Dashboard": screen_match,
     "👤 Player Profile": screen_player,
@@ -2663,6 +3178,17 @@ SCREENS = {
     "🛠️ Profile Editor": screen_profile_editor,
     "🗄️ Data Management": screen_data_management,
 }
+
+# Grouped navigation — (group label, icon, [screen labels]).
+NAV_GROUPS = [
+    ("Dashboard", "🏠", ["🏠 Dashboard"]),
+    ("Players", "👥", ["👤 Player Profile", "⚖️ Player Comparison",
+                       "📈 Evolution Dashboard"]),
+    ("Matches", "📊", ["📤 Upload & Overview", "📊 Match Dashboard"]),
+    ("Physical", "🏃", ["🏃 Physical / GPS"]),
+    ("Profiles", "🛠️", ["🛠️ Profile Editor"]),
+    ("Management", "⚙️", ["🗄️ Data Management", "🏛️ Club Management"]),
+]
 
 
 def main():
@@ -2676,32 +3202,70 @@ def main():
             screen_login()
         return
 
-    st.sidebar.title("⚽ Impact Platform")
-    st.sidebar.caption("Turn SciSports reports into coaching insights.")
+    # Inject the dark theme + component CSS, themed with the club's colour.
+    UI.inject_global_css(_club_color())
 
-    # Logged-in user info + logout.
-    club = db.get_club(conn(), _club())
-    club_name = club["name"] if club else "—"
-    st.sidebar.markdown(
-        f"**👤 {st.session_state.get('username')}**  \n"
-        f"🏟️ {club_name}  \n"
-        f"🔑 {st.session_state.get('role')}"
-    )
-    if st.sidebar.button("Log out", use_container_width=True):
-        do_logout()
-        st.rerun()
-    st.sidebar.divider()
-
-    # Build the navigation map; club admins & platform admins get Club Management.
+    # Build the screen map; club admins & platform admins get Club Management.
     screens = dict(SCREENS)
-    if _is_club_admin() or _is_platform_admin():
+    is_admin = _is_club_admin() or _is_platform_admin()
+    if is_admin:
         screens["🏛️ Club Management"] = screen_club_management
 
-    choice = st.sidebar.radio("Navigate", list(screens.keys()))
-    st.sidebar.divider()
-    st.sidebar.caption("Impact Framework v2.0 — 6 categories, 20 positions, "
-                       "position-based profiles.")
-    screens[choice]()
+    # Resolve the active navigation target (default: Dashboard).
+    nav = st.session_state.get("nav", "🏠 Dashboard")
+    if nav not in screens:
+        nav = "🏠 Dashboard"
+
+    # ---- Sidebar -----------------------------------------------------------
+    club = db.get_club(conn(), _club())
+    club_name = club["name"] if club else "—"
+
+    with st.sidebar:
+        st.markdown(
+            "<div class='sidebar-brand'>"
+            "<span class='sidebar-brand-logo'>⚽</span>"
+            "<span class='sidebar-brand-text'>Impact Platform</span>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        for group_label, icon, labels in NAV_GROUPS:
+            # Filter out screens the current user may not access.
+            visible = [lbl for lbl in labels if lbl in screens]
+            if not visible:
+                continue
+            st.markdown(
+                f"<div class='nav-group-label'>{icon} {group_label}</div>",
+                unsafe_allow_html=True,
+            )
+            for lbl in visible:
+                active = (lbl == nav)
+                if st.button(
+                    lbl,
+                    key=f"nav_{lbl}",
+                    use_container_width=True,
+                    type="primary" if active else "secondary",
+                ):
+                    if lbl != nav:
+                        st.session_state["nav"] = lbl
+                        st.rerun()
+
+        st.divider()
+        st.markdown(
+            "<div class='sidebar-user'>"
+            f"<div class='sidebar-user-name'>👤 {st.session_state.get('username')}</div>"
+            f"<div class='sidebar-user-meta'>🏟️ {club_name}</div>"
+            f"<div class='sidebar-user-meta'>🔑 {st.session_state.get('role')}</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("Log out", use_container_width=True, key="logout_btn"):
+            do_logout()
+            st.rerun()
+        st.caption("Impact Framework v2.0 — 6 categories, 20 positions.")
+
+    # ---- Active screen -----------------------------------------------------
+    screens[nav]()
 
 
 if __name__ == "__main__":

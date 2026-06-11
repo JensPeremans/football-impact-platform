@@ -7,8 +7,9 @@ app never builds SQL by hand.
 """
 
 import os
+import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import bcrypt
 
@@ -39,7 +40,14 @@ CREATE TABLE IF NOT EXISTS clubs (
     subscription_status TEXT NOT NULL DEFAULT 'trial',
     max_users           INTEGER NOT NULL DEFAULT 3,
     max_teams           INTEGER NOT NULL DEFAULT 3,
-    is_active           INTEGER NOT NULL DEFAULT 1
+    is_active           INTEGER NOT NULL DEFAULT 1,
+    -- Phase 4 — subscription plans (no payment provider yet).
+    subscription_plan   TEXT NOT NULL DEFAULT 'trial',
+    max_extra_users     INTEGER NOT NULL DEFAULT 0,
+    trial_start_date    TEXT,
+    trial_end_date      TEXT,
+    -- Visual upgrade — club branding (single accent colour, hex).
+    primary_color       TEXT NOT NULL DEFAULT '#10B981'
 );
 
 -- Phase 1 — authentication & multi-tenancy. Each user belongs to exactly one
@@ -159,6 +167,20 @@ CREATE TABLE IF NOT EXISTS position_weights (
     importance          REAL NOT NULL DEFAULT 5,
     FOREIGN KEY (position_profile_id) REFERENCES position_profiles(id) ON DELETE CASCADE,
     UNIQUE (position_profile_id, position, category)
+);
+
+-- Granular metric-level weighting (v2.1). Each field position stores a
+-- per-metric weight (REAL, step 0.5 in the UI) in the 0–10 range. Goalkeepers
+-- keep the legacy category-level position_weights route, so only field
+-- positions are stored here.
+CREATE TABLE IF NOT EXISTS position_metric_weights (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    position_profile_id INTEGER NOT NULL,
+    position            TEXT NOT NULL,
+    metric_key          TEXT NOT NULL,
+    weight              REAL NOT NULL CHECK (weight >= 0 AND weight <= 10),
+    FOREIGN KEY (position_profile_id) REFERENCES position_profiles(id) ON DELETE CASCADE,
+    UNIQUE (position_profile_id, position, metric_key)
 );
 
 CREATE TABLE IF NOT EXISTS stat_values (
@@ -363,6 +385,117 @@ def _migrate(conn):
     # -----------------------------------------------------------------------
     _migrate_phase3(conn)
 
+    # -----------------------------------------------------------------------
+    # v2.1 — granular metric-level weighting.
+    # Creates the position_metric_weights table (also in SCHEMA for fresh DBs)
+    # and back-fills it for every existing position profile from the framework
+    # defaults so all field positions land on a valid Profile Balance (37.5).
+    # Goalkeepers are intentionally NOT seeded here (legacy category route).
+    # Idempotent: only inserts rows that don't already exist.
+    # -----------------------------------------------------------------------
+    _migrate_granular_weights(conn)
+
+    # -----------------------------------------------------------------------
+    # Visual upgrade — club branding. Adds a single ``primary_color`` column
+    # to clubs (hex accent colour) defaulting to the framework emerald. Fully
+    # idempotent (skips if the column already exists).
+    # -----------------------------------------------------------------------
+    _migrate_club_branding(conn)
+
+
+DEFAULT_PRIMARY_COLOR = "#10B981"
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def _migrate_club_branding(conn):
+    """Add the clubs.primary_color column and backfill the default colour."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(clubs)").fetchall()}
+    if "primary_color" not in cols:
+        conn.execute(
+            "ALTER TABLE clubs ADD COLUMN primary_color TEXT NOT NULL "
+            f"DEFAULT '{DEFAULT_PRIMARY_COLOR}'"
+        )
+        conn.execute(
+            "UPDATE clubs SET primary_color = ? WHERE primary_color IS NULL "
+            "OR primary_color = ''",
+            (DEFAULT_PRIMARY_COLOR,),
+        )
+        conn.commit()
+        print("✓ Migrated: added primary_color to clubs")
+
+
+def get_club_branding(conn, club_id):
+    """Return the club's accent colour (hex), falling back to the default."""
+    club = get_club(conn, club_id)
+    if club is None:
+        return DEFAULT_PRIMARY_COLOR
+    keys = club.keys()
+    val = club["primary_color"] if "primary_color" in keys else None
+    if val and _HEX_COLOR_RE.match(val):
+        return val
+    return DEFAULT_PRIMARY_COLOR
+
+
+def update_club_branding(conn, club_id, primary_color):
+    """Validate and persist a club's accent colour. Raises ValueError on bad hex."""
+    if not primary_color or not _HEX_COLOR_RE.match(primary_color.strip()):
+        raise ValueError("Ongeldige kleurcode. Gebruik een hex-waarde zoals #10B981.")
+    conn.execute(
+        "UPDATE clubs SET primary_color = ? WHERE id = ?",
+        (primary_color.strip(), club_id),
+    )
+    conn.commit()
+
+
+def _migrate_granular_weights(conn):
+    """Back-fill position_metric_weights for existing profiles. Idempotent."""
+    # Ensure the table exists even on older DBs that predate SCHEMA changes.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS position_metric_weights (
+               id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+               position_profile_id INTEGER NOT NULL,
+               position            TEXT NOT NULL,
+               metric_key          TEXT NOT NULL,
+               weight              REAL NOT NULL CHECK (weight >= 0 AND weight <= 10),
+               FOREIGN KEY (position_profile_id) REFERENCES position_profiles(id) ON DELETE CASCADE,
+               UNIQUE (position_profile_id, position, metric_key)
+           )"""
+    )
+    profiles = conn.execute("SELECT id FROM position_profiles").fetchall()
+    if not profiles:
+        conn.commit()
+        return
+    defaults = M.default_position_metric_weights()
+    seeded = 0
+    for prof in profiles:
+        pid = prof["id"]
+        existing = {
+            (r["position"], r["metric_key"])
+            for r in conn.execute(
+                """SELECT position, metric_key FROM position_metric_weights
+                   WHERE position_profile_id=?""",
+                (pid,),
+            ).fetchall()
+        }
+        rows = [
+            (pid, pos, mkey, float(w))
+            for pos, mweights in defaults.items()
+            for mkey, w in mweights.items()
+            if (pos, mkey) not in existing
+        ]
+        if rows:
+            conn.executemany(
+                """INSERT INTO position_metric_weights
+                   (position_profile_id, position, metric_key, weight)
+                   VALUES (?, ?, ?, ?)""",
+                rows,
+            )
+            seeded += len(rows)
+    conn.commit()
+    if seeded:
+        print(f"✓ Migrated: seeded {seeded} granular metric weights "
+              f"across {len(profiles)} position profile(s)")
+
 
 def _migrate_phase3(conn):
     """Add team_id to data tables + user_team_assignments junction. Idempotent."""
@@ -543,6 +676,25 @@ def _migrate_phase2(conn):
             "ALTER TABLE clubs ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
         )
         print("✓ Migrated: added is_active to clubs")
+    # Phase 4 — subscription plan columns.
+    if "subscription_plan" not in club_cols:
+        conn.execute(
+            "ALTER TABLE clubs ADD COLUMN subscription_plan TEXT NOT NULL "
+            "DEFAULT 'trial'"
+        )
+        print("✓ Migrated: added subscription_plan to clubs")
+    if "max_extra_users" not in club_cols:
+        conn.execute(
+            "ALTER TABLE clubs ADD COLUMN max_extra_users INTEGER NOT NULL "
+            "DEFAULT 0"
+        )
+        print("✓ Migrated: added max_extra_users to clubs")
+    if "trial_start_date" not in club_cols:
+        conn.execute("ALTER TABLE clubs ADD COLUMN trial_start_date TEXT")
+        print("✓ Migrated: added trial_start_date to clubs")
+    if "trial_end_date" not in club_cols:
+        conn.execute("ALTER TABLE clubs ADD COLUMN trial_end_date TEXT")
+        print("✓ Migrated: added trial_end_date to clubs")
 
     user_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
     if "email" not in user_cols:
@@ -837,6 +989,23 @@ def authenticate_full(conn, username, password):
     club = get_club(conn, user["club_id"])
     if club is not None and "is_active" in club.keys() and not club["is_active"]:
         return None, "club_inactive"
+    # Phase 4 — subscription/trial access gate. platform_admin bypasses.
+    if club is not None and user["role"] != "platform_admin":
+        keys = club.keys()
+        status = club["subscription_status"] if "subscription_status" in keys else "active"
+        if status not in ACTIVE_STATUSES:
+            # inactive / cancelled / expired → no access.
+            return None, "subscription_inactive"
+        if status == "trial":
+            trial_end = club["trial_end_date"] if "trial_end_date" in keys else None
+            if _trial_expired(trial_end):
+                # Auto-mark expired so the state is persistent.
+                conn.execute(
+                    "UPDATE clubs SET subscription_status = 'expired' WHERE id = ?",
+                    (club["id"],),
+                )
+                conn.commit()
+                return None, "trial_expired"
     return user, None
 
 
@@ -847,11 +1016,41 @@ VALID_ROLES = ("platform_admin", "club_admin", "analyst", "coach")
 # Roles a club_admin is allowed to assign to members of their own club.
 CLUB_ASSIGNABLE_ROLES = ("analyst", "coach")
 
+# ---------------------------------------------------------------------------
+# Phase 4 — subscription plans. Limits count EXTRA users only; the single
+# club_admin is NOT counted as an extra user. No payment provider yet.
+# ---------------------------------------------------------------------------
+TRIAL_DAYS = 7
+PLAN_LIMITS = {
+    "trial":    {"max_teams": 1,  "max_extra_users": 1},
+    "basic":    {"max_teams": 1,  "max_extra_users": 1},
+    "advanced": {"max_teams": 3,  "max_extra_users": 3},
+    "pro":      {"max_teams": 5,  "max_extra_users": 10},
+    "elite":    {"max_teams": 10, "max_extra_users": 30},
+}
+VALID_PLANS = tuple(PLAN_LIMITS.keys())
+VALID_STATUSES = ("active", "trial", "inactive", "cancelled", "expired")
+# Statuses that grant access. 'trial' access is additionally time-gated.
+ACTIVE_STATUSES = ("active", "trial")
+
 
 def get_club_user_count(conn, club_id):
     """Number of users belonging to a club (active + inactive)."""
     return conn.execute(
         "SELECT COUNT(*) c FROM users WHERE club_id = ?", (club_id,)
+    ).fetchone()["c"]
+
+
+def get_extra_user_count(conn, club_id):
+    """Number of EXTRA users in a club: everyone except club_admin/platform_admin.
+
+    The single club_admin (and any platform_admin) is never counted against
+    the subscription's max_extra_users limit.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) c FROM users WHERE club_id = ? "
+        "AND role NOT IN ('club_admin', 'platform_admin')",
+        (club_id,),
     ).fetchone()["c"]
 
 
@@ -863,25 +1062,100 @@ def get_club_team_count(conn, club_id):
 
 
 def _club_limits(conn, club_id):
+    """Return (max_extra_users, max_teams) for a club, with safe fallbacks."""
     club = get_club(conn, club_id)
     if club is None:
         return 0, 0
     keys = club.keys()
-    max_users = club["max_users"] if "max_users" in keys else 3
-    max_teams = club["max_teams"] if "max_teams" in keys else 3
-    return max_users, max_teams
+    max_teams = club["max_teams"] if "max_teams" in keys else 1
+    if "max_extra_users" in keys and club["max_extra_users"] is not None:
+        max_extra = club["max_extra_users"]
+    else:
+        # Legacy DB without the column: derive from old max_users (minus the
+        # one club_admin seat) so behaviour stays sensible.
+        legacy = club["max_users"] if "max_users" in keys else 1
+        max_extra = max(0, (legacy or 1) - 1)
+    return max_extra, max_teams
 
 
 def can_add_user(conn, club_id):
-    """True if the club has not yet reached its max_users limit."""
-    max_users, _ = _club_limits(conn, club_id)
-    return get_club_user_count(conn, club_id) < max_users
+    """True if the club can still add another EXTRA user.
+
+    The club_admin does not count; only extra users are limited.
+    """
+    max_extra, _ = _club_limits(conn, club_id)
+    return get_extra_user_count(conn, club_id) < max_extra
 
 
 def can_add_team(conn, club_id):
     """True if the club has not yet reached its max_teams limit."""
     _, max_teams = _club_limits(conn, club_id)
     return get_club_team_count(conn, club_id) < max_teams
+
+
+def get_club_plan_info(conn, club_id):
+    """Return a dict summarising a club's plan, status and usage vs limits.
+
+    Keys: plan, status, max_teams, max_extra_users, team_count,
+    extra_user_count, teams_left, extra_users_left, trial_end_date,
+    trial_active, access. Used by both the platform-admin and club-admin UI.
+    """
+    club = get_club(conn, club_id)
+    if club is None:
+        return None
+    keys = club.keys()
+    plan = club["subscription_plan"] if "subscription_plan" in keys else "trial"
+    status = club["subscription_status"] if "subscription_status" in keys else "trial"
+    max_extra, max_teams = _club_limits(conn, club_id)
+    team_count = get_club_team_count(conn, club_id)
+    extra_count = get_extra_user_count(conn, club_id)
+    trial_end = club["trial_end_date"] if "trial_end_date" in keys else None
+    trial_active = True
+    if status == "trial" and trial_end:
+        trial_active = not _trial_expired(trial_end)
+    access = (status in ACTIVE_STATUSES) and (status != "trial" or trial_active)
+    return {
+        "plan": plan,
+        "status": status,
+        "max_teams": max_teams,
+        "max_extra_users": max_extra,
+        "team_count": team_count,
+        "extra_user_count": extra_count,
+        "teams_left": max(0, max_teams - team_count),
+        "extra_users_left": max(0, max_extra - extra_count),
+        "trial_end_date": trial_end,
+        "trial_active": trial_active,
+        "access": access,
+    }
+
+
+def _trial_expired(trial_end_date):
+    """True if a trial_end_date (ISO string) is strictly in the past."""
+    if not trial_end_date:
+        return False
+    try:
+        end = datetime.fromisoformat(trial_end_date)
+    except (ValueError, TypeError):
+        return False
+    return datetime.now() > end
+
+
+def apply_plan_limits(conn, club_id, plan):
+    """Set max_teams/max_extra_users from PLAN_LIMITS for the given plan.
+
+    Does not change status or trial dates. Returns the applied limits dict.
+    """
+    plan = (plan or "").strip().lower()
+    limits = PLAN_LIMITS.get(plan)
+    if limits is None:
+        raise ValueError("invalid_plan")
+    conn.execute(
+        "UPDATE clubs SET subscription_plan = ?, max_teams = ?, "
+        "max_extra_users = ? WHERE id = ?",
+        (plan, limits["max_teams"], limits["max_extra_users"], club_id),
+    )
+    conn.commit()
+    return limits
 
 
 def club_name_exists(conn, name):
@@ -898,6 +1172,7 @@ def list_clubs(conn):
     for c in rows:
         d = dict(c)
         d["user_count"] = get_club_user_count(conn, c["id"])
+        d["extra_user_count"] = get_extra_user_count(conn, c["id"])
         d["team_count"] = get_club_team_count(conn, c["id"])
         out.append(d)
     return out
@@ -1095,12 +1370,16 @@ def create_club_user(conn, club_id, username, password, role="coach",
 
     Raises ValueError with one of: 'limit_reached', 'empty', 'bad_role',
     'username_taken', 'email_taken'. Returns the new user id.
+
+    Security: a club_admin may only create 'coach' or 'analyst' users. The
+    elevated roles (club_admin / platform_admin) cannot be assigned through
+    this path, so club admins can never grant platform rights.
     """
     username = (username or "").strip()
     email = (email or "").strip() or None
     if not username or not password:
         raise ValueError("empty")
-    if role not in VALID_ROLES:
+    if role not in CLUB_ASSIGNABLE_ROLES:
         raise ValueError("bad_role")
     if not can_add_user(conn, club_id):
         raise ValueError("limit_reached")
@@ -1127,11 +1406,29 @@ def set_user_active(conn, user_id, is_active, club_id=None):
     conn.commit()
 
 
-def update_club_limits(conn, club_id, max_users, max_teams):
-    """Platform-admin: update a club's user/team limits."""
+def update_club_limits(conn, club_id, max_teams, max_extra_users):
+    """Platform-admin: directly set a club's team / extra-user limits.
+
+    This is the manual override used after a plan is chosen; it does not
+    change the plan label itself.
+    """
     conn.execute(
-        "UPDATE clubs SET max_users = ?, max_teams = ? WHERE id = ?",
-        (int(max_users), int(max_teams), club_id),
+        "UPDATE clubs SET max_teams = ?, max_extra_users = ? WHERE id = ?",
+        (int(max_teams), int(max_extra_users), club_id),
+    )
+    conn.commit()
+
+
+def update_club_plan(conn, club_id, plan):
+    """Platform-admin: change plan AND auto-apply that plan's limits."""
+    return apply_plan_limits(conn, club_id, plan)
+
+
+def update_club_trial_end(conn, club_id, trial_end_date):
+    """Platform-admin: set/extend a club's trial_end_date (ISO string)."""
+    conn.execute(
+        "UPDATE clubs SET trial_end_date = ? WHERE id = ?",
+        (trial_end_date, club_id),
     )
     conn.commit()
 
@@ -1146,7 +1443,13 @@ def set_club_active(conn, club_id, is_active):
 
 
 def update_club_subscription(conn, club_id, status):
-    """Platform-admin: set a club's subscription_status label."""
+    """Platform-admin: set a club's subscription_status label.
+
+    Valid values: active | trial | inactive | cancelled | expired.
+    """
+    status = (status or "").strip().lower()
+    if status not in VALID_STATUSES:
+        raise ValueError("invalid_status")
     conn.execute(
         "UPDATE clubs SET subscription_status = ? WHERE id = ?",
         (status, club_id),
@@ -1157,8 +1460,9 @@ def update_club_subscription(conn, club_id, status):
 def register_club(conn, club_name, username, email, password):
     """Self-service onboarding: create a club + its first club_admin user.
 
-    The new club is a 'trial' with default limits (3 users / 3 teams) and is
-    active. The first user becomes 'club_admin'. Default style/position
+    The new club starts on the 'trial' plan; its limits come from
+    PLAN_LIMITS['trial'] (1 team / 1 extra user). The first user becomes
+    'club_admin'. Default style/position
     profiles are seeded so every screen works immediately.
 
     Raises ValueError: 'club_taken', 'username_taken', 'email_taken',
@@ -1176,12 +1480,20 @@ def register_club(conn, club_name, username, email, password):
     if email and get_user_by_email(conn, email):
         raise ValueError("email_taken")
 
+    now = datetime.now()
+    trial_start = now.isoformat(timespec="seconds")
+    trial_end = (now + timedelta(days=TRIAL_DAYS)).isoformat(timespec="seconds")
+    # Trial limits come from PLAN_LIMITS so there is a single source of truth.
+    t_teams = PLAN_LIMITS["trial"]["max_teams"]
+    t_extra = PLAN_LIMITS["trial"]["max_extra_users"]
     cur = conn.execute(
         """INSERT INTO clubs
                (name, created_at, subscription_status, max_users, max_teams,
-                is_active)
-           VALUES (?, ?, 'trial', 3, 3, 1)""",
-        (club_name, _now()),
+                is_active, subscription_plan, max_extra_users,
+                trial_start_date, trial_end_date)
+           VALUES (?, ?, 'trial', ?, ?, 1, 'trial', ?, ?, ?)""",
+        (club_name, _now(), t_extra + 1, t_teams, t_extra,
+         trial_start, trial_end),
     )
     club_id = cur.lastrowid
     # Seed starter profiles for the new club.
@@ -1279,6 +1591,32 @@ def seed_default_position_profiles(conn, club_id):
            VALUES (?, ?, ?, ?)""",
         rows,
     )
+    # v2.1 — granular per-metric weights (field positions only; keepers use the
+    # legacy category route above).
+    _seed_metric_weights_for_profile(conn, pid)
+
+
+def _seed_metric_weights_for_profile(conn, position_profile_id):
+    """(Re)seed the granular metric weights for a profile from framework defaults.
+
+    Only field positions are seeded — goalkeepers keep the legacy
+    category-level position_weights route. Existing rows for the profile are
+    left untouched unless they collide (idempotent upsert).
+    """
+    metric_defaults = M.default_position_metric_weights()
+    rows = [
+        (position_profile_id, pos, mkey, float(w))
+        for pos, mweights in metric_defaults.items()
+        for mkey, w in mweights.items()
+    ]
+    conn.executemany(
+        """INSERT INTO position_metric_weights
+           (position_profile_id, position, metric_key, weight)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(position_profile_id, position, metric_key)
+           DO UPDATE SET weight=excluded.weight""",
+        rows,
+    )
 
 
 def list_position_profiles(conn, club_id=None):
@@ -1325,7 +1663,7 @@ def update_position_profile_importances(conn, position_profile_id, importances):
 
 
 def create_position_profile(conn, club_id, name, description, importances,
-                            is_default=False):
+                            is_default=False, metric_weights=None):
     cur = conn.execute(
         """INSERT INTO position_profiles (club_id, name, description, is_default, created_at)
            VALUES (?, ?, ?, ?, ?)""",
@@ -1341,6 +1679,19 @@ def create_position_profile(conn, club_id, name, description, importances,
         """INSERT INTO position_weights (position_profile_id, position, category, importance)
            VALUES (?, ?, ?, ?)""",
         rows,
+    )
+    # v2.1 — seed granular metric weights for field positions.
+    metric_weights = metric_weights or M.default_position_metric_weights()
+    mrows = [
+        (pid, pos, mkey, float(w))
+        for pos, mweights in metric_weights.items()
+        for mkey, w in mweights.items()
+    ]
+    conn.executemany(
+        """INSERT INTO position_metric_weights
+           (position_profile_id, position, metric_key, weight)
+           VALUES (?, ?, ?, ?)""",
+        mrows,
     )
     conn.commit()
     return pid
@@ -1363,6 +1714,113 @@ def reset_position_profile_to_default(conn, position_profile_id):
            VALUES (?, ?, ?, ?)""",
         rows,
     )
+    # v2.1 — reset granular metric weights too.
+    conn.execute(
+        "DELETE FROM position_metric_weights WHERE position_profile_id=?",
+        (position_profile_id,),
+    )
+    _seed_metric_weights_for_profile(conn, position_profile_id)
+    conn.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Granular metric-level weights (v2.1)
+# ---------------------------------------------------------------------------
+def get_position_metric_weights(conn, position_profile_id):
+    """Return {position: {metric_key: weight}} for field positions in a profile.
+
+    Falls back to framework defaults for any missing position/metric so a
+    freshly-migrated or partially-populated profile always scores sensibly.
+    """
+    rows = conn.execute(
+        """SELECT position, metric_key, weight FROM position_metric_weights
+           WHERE position_profile_id=?""",
+        (position_profile_id,),
+    ).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["position"], {})[r["metric_key"]] = r["weight"]
+    defaults = M.default_position_metric_weights()
+    for pos, mweights in defaults.items():
+        out.setdefault(pos, {})
+        for mkey, w in mweights.items():
+            out[pos].setdefault(mkey, w)
+    return out
+
+
+def update_position_metric_weights(conn, position_profile_id, metric_weights,
+                                   validate=True):
+    """Upsert granular metric weights for one or more field positions.
+
+    Args:
+        metric_weights: {position: {metric_key: weight(0-10)}}.
+        validate:       when True (default) every supplied position's Profile
+                        Balance must fall in the 35–40 window, otherwise a
+                        ValueError is raised and nothing is written.
+
+    Returns True on success. Raises ValueError on a balance / range violation.
+    """
+    # Server-side validation — never trust the client.
+    if validate:
+        for pos, mweights in metric_weights.items():
+            for mkey, w in mweights.items():
+                try:
+                    wf = float(w)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Ongeldig gewicht voor {pos}/{mkey}: {w!r}")
+                if wf < 0 or wf > 10:
+                    raise ValueError(
+                        f"Gewicht voor {pos}/{mkey} moet tussen 0 en 10 liggen "
+                        f"(was {wf}).")
+            ok, total, status = M.validate_position_balance(mweights)
+            if not ok:
+                raise ValueError(
+                    f"Profile Balance voor {pos} is {total} ({status}); "
+                    f"moet tussen {M.BALANCE_MIN} en {M.BALANCE_MAX} liggen.")
+
+    for pos, mweights in metric_weights.items():
+        for mkey, w in mweights.items():
+            conn.execute(
+                """INSERT INTO position_metric_weights
+                   (position_profile_id, position, metric_key, weight)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(position_profile_id, position, metric_key)
+                   DO UPDATE SET weight=excluded.weight""",
+                (position_profile_id, pos, mkey, float(w)),
+            )
+    conn.commit()
+    return True
+
+
+def reset_position_metric_weights_to_default(conn, position_profile_id,
+                                             position=None):
+    """Reset granular metric weights to framework defaults.
+
+    When ``position`` is given only that position is reset; otherwise all field
+    positions in the profile are reset.
+    """
+    defaults = M.default_position_metric_weights()
+    if position is not None:
+        conn.execute(
+            """DELETE FROM position_metric_weights
+               WHERE position_profile_id=? AND position=?""",
+            (position_profile_id, position),
+        )
+        mweights = defaults.get(position, {})
+        conn.executemany(
+            """INSERT INTO position_metric_weights
+               (position_profile_id, position, metric_key, weight)
+               VALUES (?, ?, ?, ?)""",
+            [(position_profile_id, position, mkey, float(w))
+             for mkey, w in mweights.items()],
+        )
+    else:
+        conn.execute(
+            "DELETE FROM position_metric_weights WHERE position_profile_id=?",
+            (position_profile_id,),
+        )
+        _seed_metric_weights_for_profile(conn, position_profile_id)
     conn.commit()
     return True
 

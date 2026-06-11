@@ -45,7 +45,11 @@ def compute_impact(stats, weights):
         contrib = value * weight * meta["sign"]
         contributions[key] = contrib
         total_impact += contrib
-        category_impact[meta["category"]] += contrib
+        # Goalkeeping (and any future) categories are not in the 6 field
+        # CATEGORIES, so use setdefault to stay robust.
+        category_impact[meta["category"]] = (
+            category_impact.get(meta["category"], 0.0) + contrib
+        )
         if meta["action_group"] == M.OFFENSIVE:
             offensive_impact += contrib
         elif meta["action_group"] == M.DEFENSIVE:
@@ -135,6 +139,171 @@ def compute_player_match_rows_positional(player_stats_list, importances_map):
         new["effective_position"] = pos
         out.append(new)
     return out
+
+
+# ===========================================================================
+# Granular metric-level scoring (v2.1) — dual Impact Score / Impact Score+
+# ===========================================================================
+#
+# The granular model stores a 0–10 weight *per metric* (not per category). The
+# scoring split is:
+#
+#   * Impact Score        = Σ of the 5 TECHNICAL field categories AFTER the 35%
+#                           per-category cap. Always available.
+#   * Physical Contribution = the Physical category total. Only meaningful when
+#                           physical tracking data is present (else None).
+#   * Impact Score+       = Impact Score + Physical Contribution. Only available
+#                           when physical data is present (else None).
+#
+# Goalkeepers do NOT use this route — they keep the legacy category-level
+# importances path (see compute_player_match_rows_positional). Field players use
+# the granular metric weights.
+# ---------------------------------------------------------------------------
+
+def is_keeper_position(position):
+    """True when a position is a goalkeeper (uses the legacy scoring route)."""
+    return M.POSITION_GROUP.get(position) == "goalkeeper"
+
+
+def compute_dual_impact(stats, metric_weights, physical_stats=None):
+    """Compute the dual Impact Score / Impact Score+ breakdown for one match.
+
+    Args:
+        stats:          {metric_key: value} — the technical (field) stats.
+        metric_weights: {metric_key: weight(0–10)} for the played position.
+        physical_stats: optional {phys_metric_key: value}. When None (or empty),
+                        no physical data is available: Physical Contribution and
+                        Impact Score+ are reported as None.
+
+    Returns a dict shaped like compute_impact() (so existing dashboards keep
+    working) plus the granular fields:
+        total_impact            -> Impact Score (== impact_score) for back-compat
+        impact_score            -> Σ capped technical categories
+        physical_contribution   -> Physical total, or None when no physical data
+        impact_plus             -> impact_score + physical, or None
+        has_physical            -> bool
+        category_impact         -> capped technical values + Physical (+ GK)
+        category_impact_raw      -> uncapped technical values (transparency)
+        capped_categories        -> set of technical categories pinned at the cap
+    """
+    stats = dict(stats or {})
+    has_physical = bool(physical_stats)
+    if has_physical:
+        # Merge physical metric values (phys_* keys) into the stat dict so the
+        # shared compute_impact() picks them up under the Physical category.
+        for k, v in physical_stats.items():
+            if v is not None:
+                stats[k] = v
+
+    scoring_weights = M.build_scoring_weights(metric_weights)
+    base = compute_impact(stats, scoring_weights)
+    cat_impact = dict(base["category_impact"])
+
+    # Split technical vs physical vs goalkeeping.
+    technical_raw = {c: cat_impact.get(c, 0.0) for c in M.TECHNICAL_CATEGORIES}
+    capped, pinned, raw = M.apply_category_cap(technical_raw)
+
+    impact_score = round(sum(capped.values()), 1)
+
+    physical_total = cat_impact.get(M.PHYSICAL_CATEGORY, 0.0)
+    if has_physical:
+        physical_contribution = round(physical_total, 1)
+        impact_plus = round(impact_score + physical_contribution, 1)
+    else:
+        physical_contribution = None
+        impact_plus = None
+
+    # Rebuild the public category_impact: capped technical values, the Physical
+    # total (or 0.0 when absent), and any keeper category that slipped through.
+    new_cat_impact = {c: round(capped.get(c, 0.0), 1) for c in M.TECHNICAL_CATEGORIES}
+    new_cat_impact[M.PHYSICAL_CATEGORY] = round(physical_total, 1)
+    for c, v in cat_impact.items():
+        if c not in new_cat_impact:
+            new_cat_impact[c] = round(v, 1)
+
+    out = dict(base)
+    out["category_impact"] = new_cat_impact
+    out["category_impact_raw"] = {c: round(v, 1) for c, v in raw.items()}
+    out["capped_categories"] = set(pinned)
+    out["impact_score"] = impact_score
+    out["physical_contribution"] = physical_contribution
+    out["impact_plus"] = impact_plus
+    out["has_physical"] = has_physical
+    # Back-compat: dashboards read total_impact. Impact Score is the headline.
+    out["total_impact"] = impact_score
+    # Recompute per-90 against the capped Impact Score so it stays consistent.
+    minutes = base.get("minutes_played") or 0.0
+    out["impact_per_90"] = round((impact_score / minutes * 90.0), 1) if minutes > 0 else 0.0
+    return out
+
+
+def compute_player_match_rows_metric(player_stats_list, metric_weights_map,
+                                     gk_importances=None, physical_by_row=None):
+    """Score player-match rows with the granular metric-level model.
+
+    Field players are scored with compute_dual_impact() using their position's
+    stored metric weights; goalkeepers fall back to the legacy category-level
+    importances route so keeper scoring is unchanged.
+
+    Args:
+        player_stats_list: rows (each with 'stats'); same shape as elsewhere.
+        metric_weights_map: {position: {metric_key: weight}} for field players.
+        gk_importances:    {position: {category: importance}} for keepers
+                           (legacy route). Optional.
+        physical_by_row:   optional callable(row) -> {phys_key: value} or None,
+                           OR a dict keyed by id(row). When it returns falsy the
+                           row has no physical data.
+
+    Each output row gets 'impact' and 'effective_position' keys.
+    """
+    metric_weights_map = metric_weights_map or {}
+    gk_importances = gk_importances or {}
+    out = []
+    for row in player_stats_list:
+        pos = effective_position(row)
+        stats = row.get("stats", {})
+        if is_keeper_position(pos):
+            weights = weights_for_position(gk_importances, pos)
+            impact = compute_impact(stats, weights)
+        else:
+            mweights = metric_weights_map.get(pos)
+            if mweights is None:
+                defaults = M.default_position_metric_weights()
+                mweights = defaults.get(pos, {})
+            phys = None
+            if callable(physical_by_row):
+                phys = physical_by_row(row)
+            elif isinstance(physical_by_row, dict):
+                phys = physical_by_row.get(id(row))
+            impact = compute_dual_impact(stats, mweights, phys)
+        new = dict(row)
+        new["impact"] = impact
+        new["effective_position"] = pos
+        out.append(new)
+    return out
+
+
+def career_summary_metric(history_rows, metric_weights_map, gk_importances=None,
+                          physical_by_row=None):
+    """Career-level aggregates using the granular metric-level scoring model.
+
+    Mirrors career_summary_positional() (same return shape incl. 'by_position')
+    but routes field players through compute_dual_impact().
+    """
+    rows = compute_player_match_rows_metric(
+        history_rows, metric_weights_map, gk_importances, physical_by_row)
+    summary = _summarize_rows(rows, position_key="effective_position")
+    if not rows:
+        return summary
+
+    by_position = {}
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r.get("effective_position") or "Unknown", []).append(r)
+    for pos, prows in grouped.items():
+        by_position[pos] = _summarize_rows(prows, position_key="effective_position")
+    summary["by_position"] = by_position
+    return summary
 
 
 def aggregate_team_impact(player_rows):

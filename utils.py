@@ -7,8 +7,59 @@ import plotly.express as px
 
 import metrics as M
 
-# A clean, coach-friendly colour palette
-PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+# Category palette — order aligned with M.CATEGORIES so radar axes & bars share
+# one colour-per-category mapping across the whole app (see ui.CATEGORY_COLORS).
+PALETTE = ["#3B82F6", "#06B6D4", "#8B5CF6", "#10B981", "#F59E0B", "#EC4899"]
+
+# Position-group palette (pitch & rankings).
+POSITION_GROUP_COLORS = {
+    "goalkeeper": "#F59E0B",
+    "defender": "#3B82F6",
+    "midfielder": "#10B981",
+    "attacker": "#EF4444",
+}
+
+# Chart text/grid tokens (dark theme).
+_GRID = "rgba(51,65,85,0.4)"
+_GRID_POLAR = "rgba(51,65,85,0.55)"
+_AXIS = "#475569"
+_TEXT = "#CBD5E1"
+_TEXT_MUTED = "#94A3B8"
+_TITLE = "#F1F5F9"
+
+
+def _apply_dark_layout(fig, primary=None):
+    """Apply the shared dark Plotly theme to any figure.
+
+    ``primary`` (optional) sets the club accent as the first colourway entry so
+    single-series charts adopt the club colour.
+    """
+    colorway = list(PALETTE)
+    if primary:
+        colorway = [primary] + [c for c in PALETTE if c.lower() != primary.lower()]
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, sans-serif", color=_TEXT, size=12),
+        title=dict(font=dict(color=_TITLE, size=16)),
+        legend=dict(bgcolor="rgba(30,41,59,0.6)", bordercolor="#334155",
+                    borderwidth=1, font=dict(color=_TEXT)),
+        colorway=colorway,
+    )
+    fig.update_xaxes(gridcolor=_GRID, zerolinecolor=_AXIS, linecolor=_AXIS,
+                     tickfont=dict(color=_TEXT_MUTED))
+    fig.update_yaxes(gridcolor=_GRID, zerolinecolor=_AXIS, linecolor=_AXIS,
+                     tickfont=dict(color=_TEXT_MUTED))
+    # Polar (radar) styling — only affects figures that have a polar subplot.
+    fig.update_layout(
+        polar=dict(
+            bgcolor="rgba(0,0,0,0)",
+            radialaxis=dict(gridcolor=_GRID_POLAR, tickfont=dict(color="#64748B"),
+                            linecolor=_AXIS),
+            angularaxis=dict(gridcolor=_GRID_POLAR, tickfont=dict(color=_TEXT)),
+        )
+    )
+    return fig
 
 
 def fmt_score(match):
@@ -36,24 +87,27 @@ def result_for_home(match):
     return "D"
 
 
-def radar_chart(category_values_list, names, title="Category Impact"):
+def radar_chart(category_values_list, names, title="Category Impact", primary=None):
     """Build a radar chart.
 
     category_values_list: list of dict {category: value} (one per series).
     names: list of series names.
+    primary: optional club accent for single-series fill.
     """
     cats = M.CATEGORIES
     fig = go.Figure()
+    single = len(names) == 1
     for i, (cv, name) in enumerate(zip(category_values_list, names)):
         values = [cv.get(c, 0) for c in cats]
         values += values[:1]
+        line_color = (primary if (single and primary) else PALETTE[i % len(PALETTE)])
         fig.add_trace(go.Scatterpolar(
             r=values,
             theta=cats + cats[:1],
             fill="toself",
             name=name,
-            line=dict(color=PALETTE[i % len(PALETTE)]),
-            opacity=0.65,
+            line=dict(color=line_color),
+            opacity=0.6,
         ))
     fig.update_layout(
         polar=dict(radialaxis=dict(visible=True)),
@@ -62,7 +116,7 @@ def radar_chart(category_values_list, names, title="Category Impact"):
         margin=dict(l=40, r=40, t=60, b=40),
         height=450,
     )
-    return fig
+    return _apply_dark_layout(fig, primary)
 
 
 def metric_radar_chart(values_list, names, axis_labels, title="Metric detail",
@@ -110,10 +164,10 @@ def metric_radar_chart(values_list, names, axis_labels, title="Metric detail",
         margin=dict(l=40, r=40, t=60, b=40),
         height=450,
     )
-    return fig
+    return _apply_dark_layout(fig)
 
 
-def rolling_line_chart(df, x, y, title, windows=(3, 5)):
+def rolling_line_chart(df, x, y, title, windows=(3, 5), primary=None):
     """Line chart of a raw time series plus N-match rolling averages.
 
     Keeps the raw match-by-match values as the primary (solid) line and overlays
@@ -131,7 +185,7 @@ def rolling_line_chart(df, x, y, title, windows=(3, 5)):
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=d[x], y=d[y], mode="lines+markers", name="Raw data",
-        line=dict(color=PALETTE[0], width=2),
+        line=dict(color=primary or PALETTE[0], width=2),
     ))
     dash_styles = ["dash", "dot", "dashdot"]
     for i, w in enumerate(windows):
@@ -143,15 +197,15 @@ def rolling_line_chart(df, x, y, title, windows=(3, 5)):
         ))
     fig.update_layout(title=title, margin=dict(l=20, r=20, t=50, b=20),
                       height=380, hovermode="x unified")
-    return fig
+    return _apply_dark_layout(fig, primary)
 
 
-def line_chart(df, x, y, title, color=None, markers=True):
+def line_chart(df, x, y, title, color=None, markers=True, primary=None):
     fig = px.line(df, x=x, y=y, title=title, color=color, markers=markers,
                   color_discrete_sequence=PALETTE)
     fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), height=380,
                       hovermode="x unified")
-    return fig
+    return _apply_dark_layout(fig, primary)
 
 
 def stacked_area(df, x, y, color, title):
@@ -159,21 +213,21 @@ def stacked_area(df, x, y, color, title):
                   color_discrete_sequence=PALETTE)
     fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), height=420,
                       hovermode="x unified")
-    return fig
+    return _apply_dark_layout(fig)
 
 
 def bar_comparison(df, x, y, color, title, barmode="group"):
     fig = px.bar(df, x=x, y=y, color=color, barmode=barmode, title=title,
                  color_discrete_sequence=PALETTE)
     fig.update_layout(margin=dict(l=20, r=20, t=50, b=20), height=420)
-    return fig
+    return _apply_dark_layout(fig)
 
 
-def highlight_max(df, columns, color="#c6f6d5"):
+def highlight_max(df, columns, color="rgba(16,185,129,0.22)"):
     """Return a pandas Styler that highlights the max value per given column."""
     def _hl(s):
         is_max = s == s.max()
-        return [f"background-color: {color}; font-weight:600" if v else "" for v in is_max]
+        return [f"background-color: {color}; font-weight:600; color:#F1F5F9" if v else "" for v in is_max]
     sty = df.style
     valid = [c for c in columns if c in df.columns]
     if valid:
@@ -181,10 +235,10 @@ def highlight_max(df, columns, color="#c6f6d5"):
     return sty
 
 
-def highlight_min(df, columns, color="#fed7d7"):
+def highlight_min(df, columns, color="rgba(239,68,68,0.20)"):
     def _hl(s):
         is_min = s == s.min()
-        return [f"background-color: {color}; font-weight:600" if v else "" for v in is_min]
+        return [f"background-color: {color}; font-weight:600; color:#F1F5F9" if v else "" for v in is_min]
     sty = df.style
     valid = [c for c in columns if c in df.columns]
     if valid:
@@ -253,7 +307,7 @@ def pitch_html(starters, bench, came_on, height=760):
           <div class="plabel">{short_name}<br><span class="ppos">{pos}</span></div>
           <div class="tooltip">
             <div class="ttname">{name}</div>
-            <div class="ttpos">{pos} · Total Impact {imp:.1f}</div>
+            <div class="ttpos">{pos} · Impact Score {imp:.1f}</div>
             {tip}
           </div>
         </div>"""
@@ -265,7 +319,7 @@ def pitch_html(starters, bench, came_on, height=760):
             extra = f"<div class='subas'>Came on as: {p['came_on_as']}</div>"
         tip = _tooltip_rows(p.get("categories", {})) if p.get("categories") else ""
         tt = (f"<div class='tooltip side'><div class='ttname'>{p['name']}</div>"
-              f"<div class='ttpos'>{p.get('position','')} · Total Impact {imp:.1f}</div>{tip}</div>") if tip else ""
+              f"<div class='ttpos'>{p.get('position','')} · Impact Score {imp:.1f}</div>{tip}</div>") if tip else ""
         return (f"<div class='sideitem'><div class='sidemain'>"
                 f"<span class='sidename'>{p['name']}</span>"
                 f"<span class='sideimp'>{imp:.1f}</span></div>"
@@ -311,18 +365,18 @@ def pitch_html(starters, bench, came_on, height=760):
   border-top:1px solid rgba(255,255,255,.12); }}
 .side {{ width:55%; }}
 .sidebar {{ width:36%; display:flex; flex-direction:column; gap:10px; }}
-.panel {{ background:#f4f6f8; border:1px solid #e0e4e8; border-radius:10px;
+.panel {{ background:#1E293B; border:1px solid #334155; border-radius:10px;
   padding:10px; }}
-.panel h4 {{ margin:0 0 8px; font-size:13px; color:#2e3b4e; }}
-.sideitem {{ position:relative; background:#fff; border:1px solid #e2e8f0;
+.panel h4 {{ margin:0 0 8px; font-size:13px; color:#F1F5F9; }}
+.sideitem {{ position:relative; background:#273449; border:1px solid #334155;
   border-radius:7px; padding:6px 8px; margin-bottom:6px; cursor:default; }}
 .sideitem:hover .tooltip {{ display:block; left:0; transform:none; top:100%; }}
 .sidemain {{ display:flex; justify-content:space-between; align-items:center; }}
-.sidename {{ font-weight:600; font-size:12px; color:#1a202c; }}
-.sideimp {{ font-weight:700; font-size:12px; color:#2e7d32; }}
-.sidepos {{ font-size:10px; color:#718096; }}
-.subas {{ font-size:10px; color:#b7791f; font-weight:600; margin-top:2px; }}
-.empty {{ color:#a0aec0; font-size:12px; font-style:italic; }}
+.sidename {{ font-weight:600; font-size:12px; color:#F1F5F9; }}
+.sideimp {{ font-weight:700; font-size:12px; color:#34D399; }}
+.sidepos {{ font-size:10px; color:#94A3B8; }}
+.subas {{ font-size:10px; color:#FBBF24; font-weight:600; margin-top:2px; }}
+.empty {{ color:#64748B; font-size:12px; font-style:italic; }}
 </style></head><body>
 <div class="wrap">
   <div class="pitch">
