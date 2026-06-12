@@ -23,6 +23,21 @@ import database as db
 import metrics as M
 
 
+# ---------------------------------------------------------------------------
+# Debug instrumentation
+# ---------------------------------------------------------------------------
+import logging
+
+log = logging.getLogger("pdf_parser")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[PDF-DEBUG] %(message)s"))
+    log.addHandler(_h)
+# Enable with FIP_PARSER_DEBUG=1 (or call log.setLevel(logging.DEBUG) directly)
+log.setLevel(logging.DEBUG if os.environ.get("FIP_PARSER_DEBUG") == "1"
+             else logging.INFO)
+
+
 class PDFParseError(Exception):
     """Raised when a PDF is not a valid SciSports player report."""
 
@@ -142,8 +157,46 @@ def detect_version(full_text):
 # The position is whatever sits inside the last pair of parentheses before the
 # match date on the header line.
 HEADER_RE = re.compile(
-    r"Player Performance\s*\((.+?)\):\s*(.+?)\s*\(([^()]+?)\)\s*(\d{4}-\d{2}-\d{2})"
+    # Run against _normalize_header_text() output (whitespace collapsed to
+    # single spaces), so the same pattern handles glued tokens, tabs,
+    # multi-space gaps and newlines inside team/name/before-date alike.
+    #   group 1: team        — non-greedy, bounded by "):"
+    #   group 2: player name — non-greedy, bounded by the LAST "(" before pos
+    #   group 3: position    — [^()]+? forbids parentheses, so it can never
+    #                          swallow part of the name or the date
+    #   group 4: date        — \s* allows zero whitespace (glued headers)
+    r"Player Performance\s*\((.+?)\)\s*:\s*(.+?)\s*\(([^()]+?)\)\s*(\d{4}-\d{2}-\d{2})",
+    re.DOTALL,
 )
+
+# All unicode whitespace (incl. NBSP \u00a0, narrow NBSP \u202f, figure space
+# \u2007, tabs, newlines) -> single ASCII space.
+_WS_RE = re.compile(r"[\s\u00a0\u1680\u2000-\u200a\u2007\u202f\u205f\u3000]+")
+
+
+def _normalize_header_text(text):
+    """Return a whitespace-normalized header snippet, or None if no header.
+
+    Layout-independence: pdfplumber's extract_text() output varies between
+    environments (line wrapping, glued tokens, tabs, NBSP). We therefore:
+      1. locate the "Player Performance" anchor,
+      2. slice the header section only — up to and including the first
+         YYYY-MM-DD date after the anchor (fallback: a 400-char window, so a
+         missing date cannot make us scan the stat block),
+      3. collapse ALL whitespace/newlines/tabs/unicode spaces to single
+         spaces and trim.
+    HEADER_RE then runs on this canonical one-line string, so newlines inside
+    the team name, the player name or before the date can no longer break
+    matching. Accents/apostrophes are untouched (only whitespace is altered).
+    """
+    idx = text.find("Player Performance")
+    if idx == -1:
+        return None
+    snippet = text[idx:idx + 400]
+    dm = DATE_RE.search(snippet)
+    if dm:
+        snippet = snippet[:dm.end()]
+    return _WS_RE.sub(" ", snippet).strip()
 
 # Map the raw SciSports position labels onto the 20 canonical positions used
 # throughout the app (see metrics.POSITIONS). Lookup is case-insensitive.
@@ -219,19 +272,42 @@ def normalize_position(raw_position):
     return raw_position.strip().title()
 
 
-def parse_player_page(text):
+def parse_player_page(text, debug=None):
     """Parse a single player page's text into a normalised stat dict.
 
     Returns dict with keys: team, name, position, stats{metric_key: value}.
     Returns None if the page is not a player page (e.g. glossary).
+
+    `debug` (optional list) collects granular checkpoint messages.
+    Every return-None branch MUST log an explicit reason — never silent.
     """
-    hm = HEADER_RE.search(text)
+    def _d(msg):
+        log.debug(msg)
+        if debug is not None:
+            debug.append(msg)
+
+    norm = _normalize_header_text(text)
+    hm = HEADER_RE.search(norm) if norm else None
     if not hm:
+        # Backward-compat fallback: try the raw page text directly (matches
+        # the pre-redesign behavior for any layout the normalizer missed).
+        hm = HEADER_RE.search(text)
+    if not hm:
+        first_lines = " | ".join(text.splitlines()[:3])[:160]
+        _d("header match: NO")
+        _d(f"normalized header attempted: \"{(norm or '')[:160]}\"")
+        _d("final result: None")
+        _d(f"reason: HEADER_RE did not match (normalized nor raw). "
+           f"First lines: \"{first_lines}\"")
         return None
     team, name, raw_position, _date = hm.groups()
     raw_position = raw_position.strip()
     position = normalize_position(raw_position)
     is_gk = "keeper" in raw_position.lower() or position == "Goalkeeper"
+    _d("header match: YES")
+    _d(f"player name: {name.strip()}")
+    _d(f"raw position: \"{raw_position}\" -> normalized: \"{position}\" "
+       f"(is_gk={is_gk}) | header date: {_date}")
 
     stats = {}
 
@@ -240,7 +316,15 @@ def parse_player_page(text):
             stats[key] = value
 
     # ---- General Information ----
-    set_v("minutes_played", _parse_number(_extract_label(text, r"Minutes Played")))
+    _raw_minutes = _extract_label(text, r"Minutes Played")
+    _min_val = _parse_number(_raw_minutes)
+    set_v("minutes_played", _min_val)
+    if _min_val is not None:
+        _d(f"minutes parsed: OK ({_min_val}) [raw label value: {_raw_minutes!r}]")
+    else:
+        _d(f"minutes parsed: FAIL [raw label value: {_raw_minutes!r}] "
+           f"— 'Minutes Played' label "
+           f"{'found but value unparseable' if _raw_minutes is not None else 'NOT found in text'}")
     set_v("total_actions", _parse_number(_extract_label(text, r"Total Actions")))
 
     m = re.search(r"Offensive\s*/\s*Defensive\s+(\d+)\s*/\s*(\d+)", text)
@@ -330,6 +414,9 @@ def parse_player_page(text):
     c, p = _parse_count_pct(_extract_label(text, r"Aerials"))
     set_v("aerials", c); set_v("aerials_pct", p)
 
+    _d(f"stat block found: {'YES' if stats else 'NO'}")
+    _d(f"stats extracted: {len(stats)}")
+    _d("final result: dict (player accepted)")
     return {"team": team.strip(), "name": name.strip(),
             "position": position, "stats": stats}
 
@@ -409,13 +496,35 @@ def parse_pdf(file_path, original_name=None):
 
     players = []
     warnings = []
+    debug_pages = []
     for page_no, txt in enumerate(pages_text[1:], start=2):
+        has_pp = "Player Performance" in txt
         if "GLOSSARY" in txt[:80].upper():
+            if has_pp:
+                entry = [f"Page {page_no}:",
+                         "* player performance detected: yes",
+                         "* final result: SKIPPED",
+                         "* reason: page starts with GLOSSARY marker "
+                         "(txt[:80] contains 'GLOSSARY')"]
+                debug_pages.append("\n".join(entry))
+                log.debug("\n".join(entry))
             continue
-        parsed = parse_player_page(txt)
+        dbg = []
+        parsed = parse_player_page(txt, debug=dbg)
+        if has_pp:
+            entry = [f"Page {page_no}:",
+                     "* player performance detected: yes"]
+            entry += [f"* {m}" for m in dbg]
+            if parsed:
+                entry.append(f"* accepted as player #{len(players) + 1}: "
+                             f"{parsed['name']} "
+                             f"(stats={len(parsed['stats'])}, "
+                             f"minutes={parsed['stats'].get('minutes_played')})")
+            debug_pages.append("\n".join(entry))
+            log.debug("\n".join(entry))
         if parsed:
             players.append(parsed)
-        elif "Player Performance" in txt:
+        elif has_pp:
             # This page looks like a player page but could not be parsed —
             # surface it instead of silently dropping the player.
             snippet = " ".join(txt.split())[:120]
@@ -423,6 +532,9 @@ def parse_pdf(file_path, original_name=None):
                 f"Page {page_no}: player page could not be parsed "
                 f"(header did not match). Text starts with: \"{snippet}…\""
             )
+    log.debug(f"parse_pdf TOTAL: {len(players)} players accepted, "
+              f"{len(warnings)} warning(s), "
+              f"{len(debug_pages)} candidate page(s) logged")
 
     if not players:
         raise PDFParseError("No player pages could be parsed from this PDF.")
@@ -432,6 +544,7 @@ def parse_pdf(file_path, original_name=None):
         "cover": cover,
         "players": players,
         "warnings": warnings,
+        "debug_pages": debug_pages,
         "season": derive_season(cover["match_date"]),
         "source_file": original_name or os.path.basename(file_path),
         "upload_hash": compute_file_hash(file_path),
