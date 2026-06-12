@@ -1967,6 +1967,170 @@ def _confirm_delete_source(group):
         st.rerun()
 
 
+def _render_force_repair(c):
+    """Platform-admin-only: force-replace a stored match from a fresh PDF parse.
+
+    Bypasses upload_hash duplicate detection, previous source_file and any
+    existing match/player rows. Deletes the stored match (matched on
+    club_id + team_id + opponent + match_date) and re-imports every parsed
+    player with full stats, then verifies parsed vs. saved counts.
+    """
+    if st.session_state.get("role") != "platform_admin":
+        return
+
+    st.divider()
+    st.subheader("🛠️ Force repair match from PDF (platform admin)")
+    st.caption("Upload a SciSports PDF and force-replace the stored match with "
+               "the newly parsed result. Duplicate detection is bypassed "
+               "completely. Use this to repair matches imported with an older "
+               "parser version.")
+
+    uf = st.file_uploader("SciSports PDF to repair from", type=["pdf"],
+                          key="force_repair_pdf")
+    if not uf:
+        return
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(uf.getbuffer())
+            tmp_path = tmp.name
+        parsed = P.parse_pdf(tmp_path, original_name=uf.name)
+    except Exception as e:  # noqa
+        st.error(f"❌ Could not parse PDF: {e}")
+        return
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    cover = parsed["cover"]
+    parsed_names = [p["name"] for p in parsed["players"]]
+
+    st.markdown("**Parsed match metadata**")
+    st.write({
+        "home_team": cover.get("home_team"),
+        "away_team": cover.get("away_team"),
+        "match_date": cover.get("match_date"),
+        "score": f"{cover.get('home_score')} - {cover.get('away_score')}",
+        "format_version": parsed.get("version"),
+        "season": parsed.get("season"),
+    })
+    st.markdown(f"**Parsed player count:** {len(parsed_names)}")
+    st.write(parsed_names)
+    for w in parsed.get("warnings") or []:
+        st.warning(f"⚠️ Parser warning: {w}")
+
+    # Locate the stored match the same way store_parsed will:
+    # club_id + team_id + opponent + match_date.
+    team_name, age_group = P.split_team_age(cover["home_team"])
+    opponent = cover.get("away_team") or "Unknown"
+    team_id = db.get_or_create_team(c, _club(), team_name, age_group)
+    existing = db.find_match(c, _club(), team_id, opponent, cover["match_date"])
+    if existing:
+        stored_rows = c.execute(
+            "SELECT p.name FROM player_match_stats s "
+            "JOIN players p ON p.id = s.player_id WHERE s.match_id = ? "
+            "ORDER BY p.name", (existing["id"],)).fetchall()
+        stored_names = [r["name"] for r in stored_rows]
+        st.markdown(
+            f"**Existing stored match found** — id `{existing['id']}`, "
+            f"source: `{existing['source_file'] or 'unknown'}`")
+        st.markdown(f"**Stored player count:** {len(stored_names)}")
+        st.write(stored_names)
+        missing_in_store = [n for n in parsed_names if n not in stored_names]
+        if missing_in_store:
+            st.warning(f"Stored match is missing {len(missing_in_store)} "
+                       f"parsed player(s): {', '.join(missing_in_store)}")
+    else:
+        st.info("No existing stored match found for this club/team/opponent/"
+                "date — force repair will create it fresh.")
+
+    if st.button("🔧 Force replace stored match", type="primary",
+                 key="force_repair_go"):
+        # ---- Status preservation: snapshot position/status/came_on_as of the
+        # currently stored match BEFORE store_parsed deletes it. Only these
+        # three line-up fields are preserved; minutes and all stats always
+        # come from the fresh parse.
+        preserve = {}
+        existing_now = db.find_match(c, _club(), team_id, opponent,
+                                     cover["match_date"])
+        if existing_now:
+            for r in c.execute(
+                    "SELECT p.name, s.position, s.status, s.came_on_as "
+                    "FROM player_match_stats s "
+                    "JOIN players p ON p.id = s.player_id "
+                    "WHERE s.match_id = ?", (existing_now["id"],)).fetchall():
+                preserve[r["name"]] = {
+                    "position": r["position"],
+                    "status": r["status"],
+                    "came_on_as": r["came_on_as"],
+                }
+        try:
+            # store_parsed deletes any existing match for the same
+            # club/team/opponent/date and re-inserts everything; it never
+            # consults upload_hash, so duplicate detection cannot block it.
+            # `overrides` preserves coach-confirmed position/status/came_on_as
+            # for players that already existed in the stored match; new
+            # players (e.g. Keynan) get parsed/default values (Starter).
+            match_id, created, n_saved = P.store_parsed(
+                c, parsed, _club(), overrides=preserve, session_type="match")
+        except Exception as e:  # noqa
+            st.error(f"❌ Force repair failed and was rolled back: {e}")
+            return
+
+        # ---- Post-save verification diagnostics ----
+        saved_rows = c.execute(
+            "SELECT p.name FROM player_match_stats s "
+            "JOIN players p ON p.id = s.player_id WHERE s.match_id = ? "
+            "ORDER BY p.name", (match_id,)).fetchall()
+        saved_names = [r["name"] for r in saved_rows]
+        missing = [n for n in parsed_names if n not in saved_names]
+
+        st.success(
+            f"✅ Force repair complete — match id `{match_id}` "
+            f"({'created' if created else 'replaced existing'}). "
+            f"Parsed players: {len(parsed_names)} · "
+            f"Saved players: {len(saved_names)}")
+        st.markdown("**Names saved:**")
+        st.write(saved_names)
+
+        # ---- Status-preservation summary ----
+        n_preserved = sum(1 for n in parsed_names if n in preserve)
+        new_players = [n for n in parsed_names if n not in preserve]
+        st.markdown(
+            f"**Statuses preserved (position/status/came_on_as):** "
+            f"{n_preserved} · **New players added:** {len(new_players)}")
+        if new_players:
+            st.write({"new_players": new_players})
+
+        target = "Keynan Majesté Wolokonoyi Shodu"
+        if target in parsed_names:
+            if target in saved_names:
+                st.success(f"✅ Verified: “{target}” exists in saved "
+                           f"player_match_stats for match {match_id}.")
+                if target in new_players:
+                    st.info(f"“{target}” was added as a NEW player "
+                            f"(default Starter status).")
+                else:
+                    st.info(f"“{target}” existed before — previous "
+                            f"status/position were preserved.")
+            else:
+                st.error(f"🚨 CRITICAL: “{target}” was parsed but is NOT in "
+                         f"saved player_match_stats — investigate immediately.")
+
+        if len(saved_names) != len(parsed_names):
+            st.error(f"❌ Count mismatch: parsed {len(parsed_names)} but saved "
+                     f"{len(saved_names)}.")
+        if missing:
+            st.error(f"❌ Missing after save: {', '.join(missing)}")
+        if not missing and len(saved_names) == len(parsed_names):
+            st.info("All parsed players verified present after save.")
+        st.cache_data.clear()
+
+
 def screen_data_management():
     UI.page_header("Data Management", "Bekijk uploadgeschiedenis en verwijder data veilig.",
                    crumb="⚙️ Management")
@@ -1993,6 +2157,7 @@ def screen_data_management():
                 "Overview screen.")
         # Physical sessions can exist independently of technical match data.
         _render_physical_sessions_management(c)
+        _render_force_repair(c)
         return
 
     # ---------------- Section A: Upload History ----------------
@@ -2040,6 +2205,9 @@ def screen_data_management():
 
     # ---------------- Section C: Physical Sessions ----------------
     _render_physical_sessions_management(c)
+
+    # ---------------- Section D: Force repair (platform admin) ----------------
+    _render_force_repair(c)
 
 
 def _render_physical_sessions_management(c):
