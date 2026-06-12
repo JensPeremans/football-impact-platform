@@ -2,6 +2,8 @@
 utils.py — Helper functions shared across the app (formatting, charts).
 """
 
+import html as _html
+
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -338,9 +340,10 @@ def pitch_html(starters, bench, came_on, height=760):
         left = x
         top = 100 - y  # invert so attackers sit near the top
         color = _impact_color(s.get("total_impact", 0) or 0, vmax)
-        name = s["name"]
-        short_name = name if len(name) <= 16 else name.split()[-1]
-        pos = s["position"]
+        raw_name = s["name"] or ""
+        name = _html.escape(raw_name)
+        short_name = name if len(raw_name) <= 16 else _html.escape(raw_name.split()[-1])
+        pos = _html.escape(str(s["position"] or ""))
         imp = s.get("total_impact", 0) or 0
         tip = _tooltip_rows(s.get("categories", {}))
         markers += f"""
@@ -357,15 +360,17 @@ def pitch_html(starters, bench, came_on, height=760):
     def _side_item(p, sub=False):
         imp = p.get("total_impact", 0) or 0
         extra = ""
+        p_name = _html.escape(str(p['name'] or ""))
+        p_pos = _html.escape(str(p.get('position', '') or ""))
         if sub and p.get("came_on_as"):
-            extra = f"<div class='subas'>Came on as: {p['came_on_as']}</div>"
+            extra = f"<div class='subas'>Came on as: {_html.escape(str(p['came_on_as']))}</div>"
         tip = _tooltip_rows(p.get("categories", {})) if p.get("categories") else ""
-        tt = (f"<div class='tooltip side'><div class='ttname'>{p['name']}</div>"
-              f"<div class='ttpos'>{p.get('position','')} · Impact Score {imp:.1f}</div>{tip}</div>") if tip else ""
+        tt = (f"<div class='tooltip side'><div class='ttname'>{p_name}</div>"
+              f"<div class='ttpos'>{p_pos} · Impact Score {imp:.1f}</div>{tip}</div>") if tip else ""
         return (f"<div class='sideitem'><div class='sidemain'>"
-                f"<span class='sidename'>{p['name']}</span>"
+                f"<span class='sidename'>{p_name}</span>"
                 f"<span class='sideimp'>{imp:.1f}</span></div>"
-                f"<div class='sidepos'>{p.get('position','')}</div>{extra}{tt}</div>")
+                f"<div class='sidepos'>{p_pos}</div>{extra}{tt}</div>")
 
     bench_html = "".join(_side_item(b) for b in bench) or "<div class='empty'>None</div>"
     came_html = "".join(_side_item(c, sub=True) for c in came_on) or "<div class='empty'>None</div>"
@@ -375,7 +380,7 @@ def pitch_html(starters, bench, came_on, height=760):
 * {{ box-sizing:border-box; font-family:-apple-system,Segoe UI,Roboto,sans-serif; }}
 .wrap {{ display:flex; gap:14px; align-items:stretch; }}
 .pitch {{
-  position:relative; width:64%; padding-bottom:88%;
+  position:relative; width:64%; height:700px;
   background:linear-gradient(#2e7d32,#388e3c); border-radius:10px;
   box-shadow:inset 0 0 0 3px rgba(255,255,255,.7); overflow:visible;
 }}

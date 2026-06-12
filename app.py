@@ -18,6 +18,7 @@ import tempfile
 
 import pandas as pd
 import plotly.express as px
+import html as _html
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -639,6 +640,10 @@ def screen_upload():
                         f"({parsed['cover']['match_date']}, format {parsed['version']}) — "
                         f"{len(parsed['players'])} players. Confirm positions below ⬇️"
                     )
+                    # Surface parser warnings (e.g. player pages that could
+                    # not be parsed) so no player is silently dropped.
+                    for w in parsed.get("warnings") or []:
+                        log.warning(f"⚠️ **{uf.name}** — {w}")
                 except P.PDFParseError as e:
                     log.error(f"❌ **{uf.name}** — {e}")
                 except Exception as e:  # noqa
@@ -3253,9 +3258,9 @@ def main():
         st.divider()
         st.markdown(
             "<div class='sidebar-user'>"
-            f"<div class='sidebar-user-name'>👤 {st.session_state.get('username')}</div>"
-            f"<div class='sidebar-user-meta'>🏟️ {club_name}</div>"
-            f"<div class='sidebar-user-meta'>🔑 {st.session_state.get('role')}</div>"
+            f"<div class='sidebar-user-name'>👤 {_html.escape(str(st.session_state.get('username') or ''))}</div>"
+            f"<div class='sidebar-user-meta'>🏟️ {_html.escape(str(club_name))}</div>"
+            f"<div class='sidebar-user-meta'>🔑 {_html.escape(str(st.session_state.get('role') or ''))}</div>"
             "</div>",
             unsafe_allow_html=True,
         )

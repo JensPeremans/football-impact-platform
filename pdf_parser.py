@@ -142,7 +142,7 @@ def detect_version(full_text):
 # The position is whatever sits inside the last pair of parentheses before the
 # match date on the header line.
 HEADER_RE = re.compile(
-    r"Player Performance\s*\((.+?)\):\s*(.+?)\s*\(([^()]+?)\)\s+(\d{4}-\d{2}-\d{2})"
+    r"Player Performance\s*\((.+?)\):\s*(.+?)\s*\(([^()]+?)\)\s*(\d{4}-\d{2}-\d{2})"
 )
 
 # Map the raw SciSports position labels onto the 20 canonical positions used
@@ -408,12 +408,21 @@ def parse_pdf(file_path, original_name=None):
         raise PDFParseError("Could not read match metadata from the cover page.")
 
     players = []
-    for txt in pages_text[1:]:
+    warnings = []
+    for page_no, txt in enumerate(pages_text[1:], start=2):
         if "GLOSSARY" in txt[:80].upper():
             continue
         parsed = parse_player_page(txt)
         if parsed:
             players.append(parsed)
+        elif "Player Performance" in txt:
+            # This page looks like a player page but could not be parsed —
+            # surface it instead of silently dropping the player.
+            snippet = " ".join(txt.split())[:120]
+            warnings.append(
+                f"Page {page_no}: player page could not be parsed "
+                f"(header did not match). Text starts with: \"{snippet}…\""
+            )
 
     if not players:
         raise PDFParseError("No player pages could be parsed from this PDF.")
@@ -422,6 +431,7 @@ def parse_pdf(file_path, original_name=None):
         "version": version,
         "cover": cover,
         "players": players,
+        "warnings": warnings,
         "season": derive_season(cover["match_date"]),
         "source_file": original_name or os.path.basename(file_path),
         "upload_hash": compute_file_hash(file_path),
